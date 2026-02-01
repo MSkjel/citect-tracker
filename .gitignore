@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# SQLite databases
+*.db
+
+# DBF files
+*.dbf
+*.DBF
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
