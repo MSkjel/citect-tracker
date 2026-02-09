@@ -10,6 +10,9 @@ import xxhash
 
 from .models import TableRecord, TableType
 
+# Fields to exclude from reading — auto-generated IDs that cause false diffs
+_IGNORED_FIELDS = {"OID"}
+
 
 def _compute_hash(fields: dict[str, str]) -> bytes:
     """Compute xxh3_128 hash of canonical JSON representation."""
@@ -61,6 +64,9 @@ def read_table(file_path: Path, table_type: TableType) -> list[TableRecord]:
         pos = offset + 1  # Skip deletion flag byte
         rec_fields: dict[str, str] = {}
         for fname, flen in fields_def:
+            if fname in _IGNORED_FIELDS:
+                pos += flen
+                continue
             raw = data[pos : pos + flen]
             try:
                 val = raw.decode("latin-1").rstrip()

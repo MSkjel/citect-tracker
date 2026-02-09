@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt
+from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QAction,
     QHeaderView,
+    QMenu,
     QTableView,
     QVBoxLayout,
     QWidget,
@@ -200,6 +202,8 @@ class DiffFilterProxy(QSortFilterProxyModel):
 class DiffViewer(QWidget):
     """Combined widget with filter bar and diff table."""
 
+    recover_requested = pyqtSignal(list)  # list[RecordDiff]
+
     def __init__(self, parent=None):
         super().__init__(parent)
 
@@ -221,8 +225,12 @@ class DiffViewer(QWidget):
         self.table.setSortingEnabled(True)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+        # Context menu
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._show_context_menu)
 
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -251,6 +259,46 @@ class DiffViewer(QWidget):
             return None
         source_index = self.proxy.mapToSource(indexes[0])
         return self.model.get_diff(source_index.row())
+
+    def get_selected_diffs(self) -> list[RecordDiff]:
+        """Get RecordDiff objects for all selected rows."""
+        indexes = self.table.selectionModel().selectedRows()
+        diffs = []
+        for idx in indexes:
+            source_index = self.proxy.mapToSource(idx)
+            diff = self.model.get_diff(source_index.row())
+            if diff:
+                diffs.append(diff)
+        return diffs
+
+    def _show_context_menu(self, position) -> None:
+        """Show right-click context menu."""
+        selected = self.get_selected_diffs()
+        if not selected:
+            return
+
+        menu = QMenu(self)
+
+        # Only offer recovery for changes that have old values
+        recoverable = [
+            d for d in selected
+            if d.change_type in (ChangeType.MODIFIED, ChangeType.ADDED)
+        ]
+
+        if recoverable:
+            count = len(recoverable)
+            if any(d.change_type == ChangeType.ADDED for d in recoverable):
+                label = f"Revert {count} selected change(s)"
+            else:
+                label = f"Recover {count} selected to old values"
+            recover_action = QAction(label, self)
+            recover_action.triggered.connect(
+                lambda: self.recover_requested.emit(recoverable)
+            )
+            menu.addAction(recover_action)
+
+        if not menu.isEmpty():
+            menu.exec_(self.table.viewport().mapToGlobal(position))
 
     def _apply_filter(self) -> None:
         self.proxy.set_filter(

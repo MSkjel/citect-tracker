@@ -20,6 +20,7 @@ a = Analysis(
         'citect_tracker.core.project_discovery',
         'citect_tracker.core.snapshot_engine',
         'citect_tracker.core.diff_engine',
+        'citect_tracker.core.dbf_writer',
         'citect_tracker.storage',
         'citect_tracker.storage.database',
         'citect_tracker.gui',

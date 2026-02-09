@@ -29,7 +29,7 @@ from .diff_viewer import DiffViewer
 from .project_tree import ProjectTree
 from .record_detail import RecordDetailDialog, RecordDetailPanel
 from .snapshot_panel import SnapshotCompareBar, SnapshotPanel
-from .workers import DiffWorker, SnapshotWorker
+from .workers import DiffWorker, RecoverWorker, SnapshotWorker
 
 
 class MainWindow(QMainWindow):
@@ -69,8 +69,9 @@ class MainWindow(QMainWindow):
         left_splitter = QSplitter(Qt.Orientation.Vertical)
 
         self.project_tree = ProjectTree()
-        self.project_tree.project_selected.connect(self._on_project_selected)
+        self.project_tree.project_filter_changed.connect(self._on_project_filter_changed)
         self.project_tree.exclusions_changed.connect(self._on_exclusions_changed)
+        self.project_tree.hidden_changed.connect(self._on_hidden_changed)
         left_splitter.addWidget(self.project_tree)
 
         self.snapshot_panel = SnapshotPanel()
@@ -107,6 +108,7 @@ class MainWindow(QMainWindow):
             self._on_diff_selection_changed
         )
         self.diff_viewer.table.doubleClicked.connect(self._on_diff_double_clicked)
+        self.diff_viewer.recover_requested.connect(self._on_recover_requested)
         right_splitter.addWidget(self.diff_viewer)
 
         self.record_detail = RecordDetailPanel()
@@ -152,10 +154,14 @@ class MainWindow(QMainWindow):
         if not self.source_dir:
             return
         try:
-            # Restore exclusions from settings before loading projects
+            # Restore exclusions and hidden from settings before loading
             excluded = QSettings().value("excluded_projects", [])
             if excluded:
                 self.project_tree.set_excluded_projects(set(excluded))
+
+            hidden = QSettings().value("hidden_projects", [])
+            if hidden:
+                self.project_tree.set_hidden_projects(set(hidden))
 
             projects = discover_projects(self.source_dir)
             self.project_tree.set_projects(projects)
@@ -345,23 +351,18 @@ class MainWindow(QMainWindow):
         """Handle compare button click - compare keeping current filter."""
         self._compare_snapshots(old_id, new_id)
 
-    def _on_project_selected(self, project_name: str) -> None:
-        """Filter diffs to a specific project and its children."""
-        if project_name:
-            # Get the project plus all its descendants
-            self._project_filter = self.project_tree.get_project_with_descendants(
-                project_name
-            )
-        else:
-            # "All Projects" selected - no filter
-            self._project_filter = None
-
-        # Apply filter to existing diff results (no need to re-query)
+    def _on_project_filter_changed(self, projects) -> None:
+        """Filter diffs to selected projects (None = show all)."""
+        self._project_filter = projects
         self.diff_viewer.set_project_filter(self._project_filter)
 
     def _on_exclusions_changed(self, excluded: set[str]) -> None:
         """Save exclusion settings when checkboxes change."""
         QSettings().setValue("excluded_projects", list(excluded))
+
+    def _on_hidden_changed(self, hidden: set[str]) -> None:
+        """Save hidden projects when they change."""
+        QSettings().setValue("hidden_projects", list(hidden))
 
     def _on_diff_selection_changed(self) -> None:
         """Update record detail panel when selection changes."""
@@ -378,6 +379,91 @@ class MainWindow(QMainWindow):
         if diff:
             dialog = RecordDetailDialog(diff, self)
             dialog.exec()
+
+    def _on_recover_requested(self, diffs: list[RecordDiff]) -> None:
+        """Handle recovery request from diff viewer context menu."""
+        if not self.source_dir:
+            QMessageBox.warning(self, "No Source", "No source directory set.")
+            return
+
+        if not diffs:
+            return
+
+        # Build confirmation message
+        lines = []
+        for d in diffs[:10]:
+            action = "Delete" if d.change_type.value == "added" else "Recover"
+            lines.append(
+                f"  {action}: {d.record_key} "
+                f"({d.project_name}/{d.table_type.display_name})"
+            )
+        if len(diffs) > 10:
+            lines.append(f"  ... and {len(diffs) - 10} more")
+
+        reply = QMessageBox.warning(
+            self,
+            "Confirm Recovery",
+            f"This will modify {len(diffs)} record(s) in the DBF files "
+            f"on disk:\n\n" + "\n".join(lines) + "\n\n"
+            "This cannot be undone. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        progress = QProgressDialog(
+            "Recovering records...", "Cancel", 0, len(diffs), self
+        )
+        progress.setWindowTitle("Recovery Progress")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        worker = RecoverWorker(
+            self.source_dir, diffs, parent=self
+        )
+
+        def on_progress(current: int, total: int, message: str) -> None:
+            progress.setMaximum(total)
+            progress.setValue(current)
+            progress.setLabelText(message)
+
+        def on_finished(successes: list[str], errors: list[str]) -> None:
+            progress.close()
+            self._active_worker = None
+
+            msg_parts = []
+            if successes:
+                msg_parts.append(f"Successfully recovered {len(successes)} record(s).")
+            if errors:
+                msg_parts.append(
+                    f"\n\n{len(errors)} error(s):\n" + "\n".join(errors[:10])
+                )
+
+            if errors:
+                QMessageBox.warning(
+                    self, "Recovery Complete", "\n".join(msg_parts)
+                )
+            else:
+                QMessageBox.information(
+                    self, "Recovery Complete", "\n".join(msg_parts)
+                )
+
+            self.status_bar.showMessage(
+                f"Recovery: {len(successes)} succeeded, {len(errors)} failed"
+            )
+
+        def on_error(msg: str) -> None:
+            progress.close()
+            self._active_worker = None
+            QMessageBox.critical(self, "Recovery Error", msg)
+
+        worker.progress.connect(on_progress)
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        self._active_worker = worker
+        worker.start()
 
     def _show_about(self) -> None:
         QMessageBox.about(
