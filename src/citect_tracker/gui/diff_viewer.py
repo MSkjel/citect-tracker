@@ -279,26 +279,15 @@ class DiffViewer(QWidget):
 
         menu = QMenu(self)
 
-        # Only offer recovery for changes that have old values
-        recoverable = [
-            d for d in selected
-            if d.change_type in (ChangeType.MODIFIED, ChangeType.ADDED)
-        ]
+        count = len(selected)
+        label = f"Revert {count} selected change(s)"
+        recover_action = QAction(label, self)
+        recover_action.triggered.connect(
+            lambda: self.recover_requested.emit(selected)
+        )
+        menu.addAction(recover_action)
 
-        if recoverable:
-            count = len(recoverable)
-            if any(d.change_type == ChangeType.ADDED for d in recoverable):
-                label = f"Revert {count} selected change(s)"
-            else:
-                label = f"Recover {count} selected to old values"
-            recover_action = QAction(label, self)
-            recover_action.triggered.connect(
-                lambda: self.recover_requested.emit(recoverable)
-            )
-            menu.addAction(recover_action)
-
-        if not menu.isEmpty():
-            menu.exec_(self.table.viewport().mapToGlobal(position))
+        menu.exec_(self.table.viewport().mapToGlobal(position))
 
     def _apply_filter(self) -> None:
         self.proxy.set_filter(

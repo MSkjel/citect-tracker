@@ -129,11 +129,77 @@ def recover_record(
             f"in {diff.project_name}/{diff.table_type.filename}"
         )
 
+    elif diff.change_type == ChangeType.DELETED:
+        if not diff.old_fields:
+            raise RecoverError(
+                f"No old field data available for '{diff.record_key}'"
+            )
+
+        # Try to find a soft-deleted record with this key and undelete it
+        deleted_row = _find_record(
+            file_data, nrecs, hlen, rlen, key_offset, key_len,
+            diff.record_key, include_deleted=True,
+        )
+
+        if deleted_row is not None and file_data[hlen + deleted_row * rlen] == 0x2A:
+            # Undelete and overwrite all fields with old values
+            rec_start = hlen + deleted_row * rlen
+            file_data[rec_start] = 0x20  # Clear deletion flag
+            _write_all_fields(
+                file_data, rec_start, field_offsets, fields_def, diff.old_fields
+            )
+            _write_file(dbf_path, file_data)
+            return (
+                f"Undeleted '{diff.record_key}' in "
+                f"{diff.project_name}/{diff.table_type.filename}"
+            )
+
+        # Record not found at all — append a new record
+        new_record = bytearray(rlen)
+        new_record[0] = 0x20  # Active record flag
+        _write_all_fields(
+            new_record, 0, field_offsets, fields_def, diff.old_fields
+        )
+        # Insert before EOF marker (0x1A) if present, otherwise append
+        if file_data[-1] == 0x1A:
+            file_data[-1:] = new_record + b"\x1a"
+        else:
+            file_data.extend(new_record)
+        # Update record count in header
+        new_nrecs = nrecs + 1
+        struct.pack_into("<I", file_data, 4, new_nrecs)
+        _write_file(dbf_path, file_data)
+        return (
+            f"Re-added '{diff.record_key}' to "
+            f"{diff.project_name}/{diff.table_type.filename}"
+        )
+
     else:
         raise RecoverError(
-            f"Cannot recover {diff.change_type.value} records "
-            f"(only modified and added records can be reverted)"
+            f"Unsupported change type: {diff.change_type.value}"
         )
+
+
+def _write_all_fields(
+    data: bytearray,
+    record_start: int,
+    field_offsets: dict[str, tuple[int, int]],
+    fields_def: list[tuple[str, int]],
+    fields: dict[str, str],
+) -> None:
+    """Write all field values into a record buffer.
+
+    Fills every field — fields not in the dict are written as spaces.
+    """
+    for fname, flen in fields_def:
+        if fname not in field_offsets:
+            continue
+        f_offset, _ = field_offsets[fname]
+        val = fields.get(fname, "")
+        encoded = val.encode("latin-1", errors="replace")
+        padded = encoded[:flen].ljust(flen, b" ")
+        write_pos = record_start + 1 + f_offset
+        data[write_pos : write_pos + flen] = padded
 
 
 def _find_record(
@@ -144,16 +210,15 @@ def _find_record(
     key_offset: int,
     key_len: int,
     target_key: str,
+    include_deleted: bool = False,
 ) -> int | None:
-    """Find a non-deleted record by key value. Returns row index or None."""
-    target_bytes = target_key.encode("latin-1", errors="replace")
-
+    """Find a record by key value. Returns row index or None."""
     for i in range(nrecs):
         rec_start = hlen + i * rlen
         if rec_start >= len(data):
             break
-        # Skip deleted records
-        if data[rec_start] == 0x2A:
+        # Skip deleted records unless we're looking for them
+        if data[rec_start] == 0x2A and not include_deleted:
             continue
         # +1 to skip deletion flag
         raw_key = data[rec_start + 1 + key_offset : rec_start + 1 + key_offset + key_len]
