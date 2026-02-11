@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
         self.project_tree.project_filter_changed.connect(self._on_project_filter_changed)
         self.project_tree.exclusions_changed.connect(self._on_exclusions_changed)
         self.project_tree.hidden_changed.connect(self._on_hidden_changed)
+        self.project_tree.view_mode_changed.connect(self._on_view_mode_changed)
         left_splitter.addWidget(self.project_tree)
 
         self.snapshot_panel = SnapshotPanel()
@@ -162,6 +163,10 @@ class MainWindow(QMainWindow):
             hidden = QSettings().value("hidden_projects", [])
             if hidden:
                 self.project_tree.set_hidden_projects(set(hidden))
+
+            flat_mode = QSettings().value("project_flat_mode", False, type=bool)
+            if flat_mode:
+                self.project_tree.set_flat_mode(True)
 
             projects = discover_projects(self.source_dir)
             self.project_tree.set_projects(projects)
@@ -363,6 +368,10 @@ class MainWindow(QMainWindow):
     def _on_hidden_changed(self, hidden: set[str]) -> None:
         """Save hidden projects when they change."""
         QSettings().setValue("hidden_projects", list(hidden))
+
+    def _on_view_mode_changed(self, flat: bool) -> None:
+        """Save view mode when it changes."""
+        QSettings().setValue("project_flat_mode", flat)
 
     def _on_diff_selection_changed(self) -> None:
         """Update record detail panel when selection changes."""

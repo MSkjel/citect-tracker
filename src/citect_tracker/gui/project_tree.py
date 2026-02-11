@@ -39,6 +39,7 @@ class ProjectTree(QWidget):
     project_filter_changed = pyqtSignal(object)  # set[str] or None for all
     exclusions_changed = pyqtSignal(set)  # set of excluded project names
     hidden_changed = pyqtSignal(set)  # set of hidden project names
+    view_mode_changed = pyqtSignal(bool)  # True = flat mode
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -47,9 +48,23 @@ class ProjectTree(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
+        # View mode toggle
+        self._view_bar = QWidget()
+        view_layout = QHBoxLayout(self._view_bar)
+        view_layout.setContentsMargins(4, 2, 4, 2)
+        view_layout.addWidget(QLabel("Projects"))
+        view_layout.addStretch()
+        self._view_toggle = QPushButton("Flat View")
+        self._view_toggle.setFixedHeight(22)
+        self._view_toggle.setStyleSheet("font-size: 11px; padding: 0 8px;")
+        self._view_toggle.clicked.connect(self._toggle_view_mode)
+        view_layout.addWidget(self._view_toggle)
+        layout.addWidget(self._view_bar)
+
         # Tree widget
+        self._flat_mode = False
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabel("Projects")
+        self.tree.setHeaderHidden(True)
         self.tree.setRootIsDecorated(True)
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.tree.selectionModel().selectionChanged.connect(
@@ -86,17 +101,21 @@ class ProjectTree(QWidget):
 
     def set_projects(self, projects: dict[str, ProjectInfo]) -> None:
         """Populate the tree from project discovery results."""
+        self._projects = projects
+        self._change_counts = {}
+
+        # Clean up exclusions/hidden to only include valid project names
+        self._excluded = self._excluded & set(projects.keys())
+        self._hidden = self._hidden & set(projects.keys())
+
+        self._rebuild_tree()
+
+    def _rebuild_tree(self) -> None:
+        """Rebuild the tree widget in the current view mode."""
         self.tree.blockSignals(True)
         self._updating = True
 
         try:
-            self._projects = projects
-            self._change_counts = {}
-
-            # Clean up exclusions/hidden to only include valid project names
-            self._excluded = self._excluded & set(projects.keys())
-            self._hidden = self._hidden & set(projects.keys())
-
             self.tree.clear()
 
             # "All Projects" root item
@@ -109,29 +128,85 @@ class ProjectTree(QWidget):
             )
             self._all_item.setCheckState(0, Qt.CheckState.Checked)
 
-            # Find top-level projects (not included by any other)
-            included_by_others: set[str] = set()
-            for p in projects.values():
-                for inc in p.includes:
-                    included_by_others.add(inc)
-
-            top_level = sorted(
-                [p for p in projects.values() if p.name not in included_by_others],
-                key=lambda p: p.name,
-            )
-
-            for project in top_level:
-                item = self._add_project_item(self._all_item, project, set())
-                item.setExpanded(True)
+            if self._flat_mode:
+                self._populate_flat()
+            else:
+                self._populate_tree()
 
             # Update "All Projects" check state based on children
             self._update_parent_check_state_no_recurse(self._all_item)
 
             # Apply hidden visibility
             self._apply_hidden_visibility()
+
+            # Re-apply change indicators if we have them
+            if self._change_counts:
+                self._apply_change_indicators()
         finally:
             self._updating = False
             self.tree.blockSignals(False)
+
+    def _populate_tree(self) -> None:
+        """Populate as hierarchical tree view."""
+        self.tree.setRootIsDecorated(True)
+
+        included_by_others: set[str] = set()
+        for p in self._projects.values():
+            for inc in p.includes:
+                included_by_others.add(inc)
+
+        top_level = sorted(
+            [p for p in self._projects.values() if p.name not in included_by_others],
+            key=lambda p: p.name,
+        )
+
+        for project in top_level:
+            item = self._add_project_item(self._all_item, project, set())
+            item.setExpanded(True)
+
+    def _populate_flat(self) -> None:
+        """Populate as flat alphabetical list."""
+        self.tree.setRootIsDecorated(False)
+
+        for project in sorted(self._projects.values(), key=lambda p: p.name):
+            self._add_flat_item(self._all_item, project)
+
+    def _add_flat_item(
+        self, parent_item: QTreeWidgetItem, project: ProjectInfo
+    ) -> QTreeWidgetItem:
+        """Add a single project item with no children."""
+        has_folder = Path(project.local_path).is_dir()
+        label = project.name
+        if project.title:
+            label = f"{project.name} - {project.title}"
+
+        item = QTreeWidgetItem(parent_item, [label])
+        item.setData(0, ROLE_PROJECT_NAME, project.name)
+        item.setData(0, ROLE_ORIGINAL_LABEL, label)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+
+        if project.name in self._excluded:
+            item.setCheckState(0, Qt.CheckState.Unchecked)
+        else:
+            item.setCheckState(0, Qt.CheckState.Checked)
+
+        if not has_folder:
+            item.setForeground(0, QColor(150, 150, 150))
+            item.setToolTip(0, "Project folder not found locally")
+
+        return item
+
+    def _toggle_view_mode(self) -> None:
+        """Switch between tree and flat view."""
+        self.set_flat_mode(not self._flat_mode)
+        self.view_mode_changed.emit(self._flat_mode)
+
+    def set_flat_mode(self, flat: bool) -> None:
+        """Set the view mode without emitting a signal."""
+        self._flat_mode = flat
+        self._view_toggle.setText("Tree View" if self._flat_mode else "Flat View")
+        if self._projects:
+            self._rebuild_tree()
 
     def _add_project_item(
         self,
@@ -522,7 +597,6 @@ class ProjectTree(QWidget):
 
     def update_change_indicators(self, diff_summary: Optional[DiffSummary]) -> None:
         """Update project items to show change counts from a diff."""
-        # Calculate change counts per project
         self._change_counts = {}
         if diff_summary:
             for project_name, tables in diff_summary.changes_by_project.items():
@@ -530,14 +604,18 @@ class ProjectTree(QWidget):
                 if count > 0:
                     self._change_counts[project_name] = count
 
-        # Block signals to prevent itemChanged from firing during label updates
+        self._apply_change_indicators()
+
+    def _apply_change_indicators(self) -> None:
+        """Apply stored change counts to tree item labels."""
         self.tree.blockSignals(True)
         self._updating = True
 
         try:
-            # Update all items in the tree (returns accumulated count)
             if self._all_item:
-                total = self._update_item_labels(self._all_item)
+                self._update_item_labels(self._all_item)
+                # All Projects shows the true deduplicated total
+                total = sum(self._change_counts.values())
                 original = self._all_item.data(0, ROLE_ORIGINAL_LABEL) or "All Projects"
                 if total > 0:
                     self._all_item.setText(0, f"{original} ({total})")
@@ -553,49 +631,69 @@ class ProjectTree(QWidget):
             self._updating = False
             self.tree.blockSignals(False)
 
-    def _update_item_labels(self, parent: QTreeWidgetItem) -> int:
-        """Recursively update item labels with change counts.
+    def _collect_unique_descendant_names(
+        self, item: QTreeWidgetItem
+    ) -> set[str]:
+        """Collect all unique project names in an item's subtree."""
+        names: set[str] = set()
+        for i in range(item.childCount()):
+            child = item.child(i)
+            name = child.data(0, ROLE_PROJECT_NAME)
+            if name:
+                names.add(name)
+            names |= self._collect_unique_descendant_names(child)
+        return names
 
-        Returns the accumulated count for this subtree.
-        """
-        accumulated = 0
-
+    def _update_item_labels(self, parent: QTreeWidgetItem) -> None:
+        """Recursively update item labels with own + included change counts."""
         for i in range(parent.childCount()):
             item = parent.child(i)
             project_name = item.data(0, ROLE_PROJECT_NAME)
             original_label = item.data(0, ROLE_ORIGINAL_LABEL)
 
-            # Get this project's own count
-            own_count = self._change_counts.get(project_name, 0) if project_name else 0
+            # Recurse first so children are updated
+            self._update_item_labels(item)
 
-            # Recursively get children's counts
-            child_count = self._update_item_labels(item)
-            total_count = own_count + child_count
-            accumulated += total_count
+            if not project_name or not original_label:
+                continue
 
-            if project_name and original_label:
-                if total_count > 0:
-                    item.setText(0, f"{original_label} ({total_count})")
-                    font = item.font(0)
-                    font.setBold(True)
-                    item.setFont(0, font)
-                    item.setForeground(0, QColor(0, 100, 180))
+            # Own changes for this project
+            own_count = self._change_counts.get(project_name, 0)
+
+            # Deduplicated included changes from unique descendant projects
+            descendant_names = self._collect_unique_descendant_names(item)
+            descendant_names.discard(project_name)
+            included_count = sum(
+                self._change_counts.get(n, 0) for n in descendant_names
+            )
+
+            # Format label
+            if own_count > 0 and included_count > 0:
+                label = f"{original_label} ({own_count} + {included_count} incl.)"
+            elif own_count > 0:
+                label = f"{original_label} ({own_count})"
+            elif included_count > 0:
+                label = f"{original_label} ({included_count} incl.)"
+            else:
+                label = original_label
+
+            item.setText(0, label)
+
+            has_changes = own_count > 0 or included_count > 0
+            font = item.font(0)
+            font.setBold(has_changes)
+            item.setFont(0, font)
+
+            if has_changes:
+                item.setForeground(0, QColor(0, 100, 180))
+            elif project_name in self._projects:
+                has_folder = Path(
+                    self._projects[project_name].local_path
+                ).is_dir()
+                if not has_folder:
+                    item.setForeground(0, QColor(150, 150, 150))
                 else:
-                    item.setText(0, original_label)
-                    font = item.font(0)
-                    font.setBold(False)
-                    item.setFont(0, font)
-                    # Restore original color (gray for missing folders)
-                    if project_name in self._projects:
-                        has_folder = Path(
-                            self._projects[project_name].local_path
-                        ).is_dir()
-                        if not has_folder:
-                            item.setForeground(0, QColor(150, 150, 150))
-                        else:
-                            item.setForeground(0, QColor(0, 0, 0))
-
-        return accumulated
+                    item.setForeground(0, QColor(0, 0, 0))
 
     def clear_change_indicators(self) -> None:
         """Remove all change indicators."""
