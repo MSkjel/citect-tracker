@@ -17,7 +17,7 @@ from ..core.models import (
     TableType,
 )
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -47,19 +47,22 @@ CREATE TABLE IF NOT EXISTS record_data (
     fields_json     TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS snapshot_records (
-    snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
-    project_name    TEXT NOT NULL,
-    table_type      TEXT NOT NULL,
-    record_key      TEXT NOT NULL,
-    record_hash     BLOB NOT NULL,
-    PRIMARY KEY (snapshot_id, project_name, table_type, record_key)
+CREATE TABLE IF NOT EXISTS record_versions (
+    project_name      TEXT NOT NULL,
+    table_type        TEXT NOT NULL,
+    record_key        TEXT NOT NULL,
+    record_hash       BLOB NOT NULL,
+    first_snapshot_id INTEGER NOT NULL,
+    last_snapshot_id  INTEGER NOT NULL,
+    PRIMARY KEY (project_name, table_type, record_key, first_snapshot_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_snapshot_records_hash
-    ON snapshot_records(snapshot_id, record_hash);
-CREATE INDEX IF NOT EXISTS idx_snapshot_records_project
-    ON snapshot_records(snapshot_id, project_name, table_type);
+CREATE INDEX IF NOT EXISTS idx_rv_lookup
+    ON record_versions(project_name, table_type, last_snapshot_id, first_snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_rv_hash
+    ON record_versions(record_hash);
+CREATE INDEX IF NOT EXISTS idx_rv_active
+    ON record_versions(project_name, table_type, record_key, last_snapshot_id);
 """
 
 
@@ -167,9 +170,60 @@ class Database:
         ]
 
     def delete_snapshot(self, snapshot_id: int, vacuum: bool = True) -> None:
-        """Delete a snapshot and optionally compact the database."""
+        """Delete a snapshot, adjusting version ranges accordingly."""
+        # Find adjacent snapshot IDs
+        prev_row = self.conn.execute(
+            "SELECT id FROM snapshots WHERE id < ? ORDER BY id DESC LIMIT 1",
+            (snapshot_id,),
+        ).fetchone()
+        next_row = self.conn.execute(
+            "SELECT id FROM snapshots WHERE id > ? ORDER BY id ASC LIMIT 1",
+            (snapshot_id,),
+        ).fetchone()
+        prev_id = prev_row["id"] if prev_row else None
+        next_id = next_row["id"] if next_row else None
+
+        # Single-snapshot versions — delete entirely
+        self.conn.execute(
+            "DELETE FROM record_versions "
+            "WHERE first_snapshot_id = ? AND last_snapshot_id = ?",
+            (snapshot_id, snapshot_id),
+        )
+
+        # Versions starting at this snapshot
+        if next_id is not None:
+            # Advance first_snapshot_id to next snapshot
+            self.conn.execute(
+                "UPDATE record_versions SET first_snapshot_id = ? "
+                "WHERE first_snapshot_id = ?",
+                (next_id, snapshot_id),
+            )
+        else:
+            # No next snapshot — remove any remaining versions starting here
+            self.conn.execute(
+                "DELETE FROM record_versions WHERE first_snapshot_id = ?",
+                (snapshot_id,),
+            )
+
+        # Versions ending at this snapshot
+        if prev_id is not None:
+            # Retreat last_snapshot_id to previous snapshot
+            self.conn.execute(
+                "UPDATE record_versions SET last_snapshot_id = ? "
+                "WHERE last_snapshot_id = ?",
+                (prev_id, snapshot_id),
+            )
+        else:
+            # No previous snapshot — remove any remaining versions ending here
+            self.conn.execute(
+                "DELETE FROM record_versions WHERE last_snapshot_id = ?",
+                (snapshot_id,),
+            )
+
+        # Delete snapshot row (cascades to snapshot_projects)
         self.conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
         self.conn.commit()
+
         self.cleanup_orphaned_records()
         if vacuum:
             self.conn.execute("VACUUM")
@@ -211,28 +265,82 @@ class Database:
         table_type: TableType,
         records: list[TableRecord],
     ) -> None:
-        """Store records with content-addressable deduplication."""
-        # Batch insert record data (ignore duplicates)
-        record_data_rows = [
-            (r.record_hash, json.dumps(r.fields, ensure_ascii=False))
-            for r in records
-        ]
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO record_data (hash, fields_json) VALUES (?, ?)",
-            record_data_rows,
-        )
+        """Store records with content-addressable dedup and version ranges."""
+        if not records:
+            return
 
-        # Batch insert snapshot_records references
-        ref_rows = [
-            (snapshot_id, project_name, table_type.value, r.key, r.record_hash)
-            for r in records
-        ]
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO snapshot_records "
-            "(snapshot_id, project_name, table_type, record_key, record_hash) "
-            "VALUES (?, ?, ?, ?, ?)",
-            ref_rows,
-        )
+        # Find the previous snapshot ID
+        prev_row = self.conn.execute(
+            "SELECT id FROM snapshots WHERE id < ? ORDER BY id DESC LIMIT 1",
+            (snapshot_id,),
+        ).fetchone()
+        prev_snapshot_id = prev_row["id"] if prev_row else None
+
+        records_by_key = {r.key: r for r in records}
+
+        if prev_snapshot_id is not None:
+            # Fetch versions active at the previous snapshot for this project/table
+            cur = self.conn.execute(
+                "SELECT record_key, record_hash, first_snapshot_id "
+                "FROM record_versions "
+                "WHERE project_name = ? AND table_type = ? "
+                "AND last_snapshot_id = ?",
+                (project_name, table_type.value, prev_snapshot_id),
+            )
+            prev_versions = {
+                row["record_key"]: (bytes(row["record_hash"]), row["first_snapshot_id"])
+                for row in cur.fetchall()
+            }
+
+            extend_rows = []
+            new_records: list[TableRecord] = []
+
+            for key, rec in records_by_key.items():
+                prev = prev_versions.get(key)
+                if prev is not None and prev[0] == rec.record_hash:
+                    # Same hash — extend the existing range
+                    extend_rows.append(
+                        (snapshot_id, project_name, table_type.value, key, prev[1])
+                    )
+                else:
+                    # New record or changed hash — needs record_data + new version
+                    new_records.append(rec)
+
+            if extend_rows:
+                self.conn.executemany(
+                    "UPDATE record_versions SET last_snapshot_id = ? "
+                    "WHERE project_name = ? AND table_type = ? "
+                    "AND record_key = ? AND first_snapshot_id = ?",
+                    extend_rows,
+                )
+
+            if new_records:
+                self.conn.executemany(
+                    "INSERT OR IGNORE INTO record_data (hash, fields_json) VALUES (?, ?)",
+                    [(r.record_hash, json.dumps(r.fields, ensure_ascii=False)) for r in new_records],
+                )
+                self.conn.executemany(
+                    "INSERT INTO record_versions "
+                    "(project_name, table_type, record_key, record_hash, "
+                    "first_snapshot_id, last_snapshot_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    [(project_name, table_type.value, r.key, r.record_hash, snapshot_id, snapshot_id)
+                     for r in new_records],
+                )
+        else:
+            # First snapshot — all records need record_data + new versions
+            self.conn.executemany(
+                "INSERT OR IGNORE INTO record_data (hash, fields_json) VALUES (?, ?)",
+                [(r.record_hash, json.dumps(r.fields, ensure_ascii=False)) for r in records],
+            )
+            self.conn.executemany(
+                "INSERT INTO record_versions "
+                "(project_name, table_type, record_key, record_hash, "
+                "first_snapshot_id, last_snapshot_id) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [(project_name, table_type.value, r.key, r.record_hash, snapshot_id, snapshot_id)
+                 for r in records],
+            )
 
     def get_record_fields(self, record_hash: bytes) -> dict[str, str]:
         """Fetch the fields for a record by its content hash."""
@@ -265,7 +373,6 @@ class Database:
         params: dict = {"old_id": old_id, "new_id": new_id}
 
         if project_filter:
-            # Build IN clause with named parameters
             placeholders = ", ".join(f":p{i}" for i in range(len(project_filter)))
             conditions.append(f"AND project_name IN ({placeholders})")
             for i, name in enumerate(project_filter):
@@ -283,13 +390,15 @@ class Database:
                old_r.table_type as table_type,
                old_r.record_key as record_key,
                old_r.record_hash as old_hash, NULL as new_hash
-        FROM snapshot_records old_r
-        LEFT JOIN snapshot_records new_r
+        FROM record_versions old_r
+        LEFT JOIN record_versions new_r
             ON old_r.project_name = new_r.project_name
             AND old_r.table_type = new_r.table_type
             AND old_r.record_key = new_r.record_key
-            AND new_r.snapshot_id = :new_id
-        WHERE old_r.snapshot_id = :old_id
+            AND new_r.first_snapshot_id <= :new_id
+            AND new_r.last_snapshot_id >= :new_id
+        WHERE old_r.first_snapshot_id <= :old_id
+            AND old_r.last_snapshot_id >= :old_id
             AND new_r.record_key IS NULL
             {extra.replace('project_name', 'old_r.project_name').replace('table_type', 'old_r.table_type') if extra else ''}
 
@@ -301,13 +410,15 @@ class Database:
                new_r.table_type as table_type,
                new_r.record_key as record_key,
                NULL as old_hash, new_r.record_hash as new_hash
-        FROM snapshot_records new_r
-        LEFT JOIN snapshot_records old_r
+        FROM record_versions new_r
+        LEFT JOIN record_versions old_r
             ON new_r.project_name = old_r.project_name
             AND new_r.table_type = old_r.table_type
             AND new_r.record_key = old_r.record_key
-            AND old_r.snapshot_id = :old_id
-        WHERE new_r.snapshot_id = :new_id
+            AND old_r.first_snapshot_id <= :old_id
+            AND old_r.last_snapshot_id >= :old_id
+        WHERE new_r.first_snapshot_id <= :new_id
+            AND new_r.last_snapshot_id >= :new_id
             AND old_r.record_key IS NULL
             {extra.replace('project_name', 'new_r.project_name').replace('table_type', 'new_r.table_type') if extra else ''}
 
@@ -319,13 +430,15 @@ class Database:
                old_r.table_type as table_type,
                old_r.record_key as record_key,
                old_r.record_hash as old_hash, new_r.record_hash as new_hash
-        FROM snapshot_records old_r
-        INNER JOIN snapshot_records new_r
+        FROM record_versions old_r
+        INNER JOIN record_versions new_r
             ON old_r.project_name = new_r.project_name
             AND old_r.table_type = new_r.table_type
             AND old_r.record_key = new_r.record_key
-            AND new_r.snapshot_id = :new_id
-        WHERE old_r.snapshot_id = :old_id
+            AND new_r.first_snapshot_id <= :new_id
+            AND new_r.last_snapshot_id >= :new_id
+        WHERE old_r.first_snapshot_id <= :old_id
+            AND old_r.last_snapshot_id >= :old_id
             AND old_r.record_hash != new_r.record_hash
             {extra.replace('project_name', 'old_r.project_name').replace('table_type', 'old_r.table_type') if extra else ''}
 
@@ -346,9 +459,9 @@ class Database:
         ]
 
     def cleanup_orphaned_records(self) -> None:
-        """Remove record_data entries not referenced by any snapshot."""
+        """Remove record_data entries not referenced by any version."""
         self.conn.execute(
             "DELETE FROM record_data WHERE hash NOT IN "
-            "(SELECT DISTINCT record_hash FROM snapshot_records)"
+            "(SELECT DISTINCT record_hash FROM record_versions)"
         )
         self.conn.commit()
