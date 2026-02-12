@@ -329,9 +329,10 @@ class Database:
                 )
         else:
             # First snapshot — all records need record_data + new versions
+            unique_records = list(records_by_key.values())
             self.conn.executemany(
                 "INSERT OR IGNORE INTO record_data (hash, fields_json) VALUES (?, ?)",
-                [(r.record_hash, json.dumps(r.fields, ensure_ascii=False)) for r in records],
+                [(r.record_hash, json.dumps(r.fields, ensure_ascii=False)) for r in unique_records],
             )
             self.conn.executemany(
                 "INSERT INTO record_versions "
@@ -339,7 +340,7 @@ class Database:
                 "first_snapshot_id, last_snapshot_id) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 [(project_name, table_type.value, r.key, r.record_hash, snapshot_id, snapshot_id)
-                 for r in records],
+                 for r in unique_records],
             )
 
     def get_record_fields(self, record_hash: bytes) -> dict[str, str]:
