@@ -7,9 +7,8 @@ name = "citect-tracker"
 version = "0.1.0"
 description = "Citect SCADA configuration change tracker - git-like diff for project configurations"
 authors = [{name = "MSkjel"}]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
-    "dbf>=0.99",
     "PyQt5>=5",
     "xxhash>=3.0",
 ]
