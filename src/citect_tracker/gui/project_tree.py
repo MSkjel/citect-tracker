@@ -417,12 +417,15 @@ class ProjectTree(QWidget):
                 self.project_filter_changed.emit(None)
                 return
 
-        # Collect all selected projects and their descendants
+        # Collect selected projects (in flat mode, no descendants)
         combined: set[str] = set()
         for item in selected_items:
             project_name = item.data(0, ROLE_PROJECT_NAME)
             if project_name:
-                self._collect_descendants(project_name, combined)
+                if self._flat_mode:
+                    combined.add(project_name)
+                else:
+                    self._collect_descendants(project_name, combined)
 
         self.project_filter_changed.emit(combined if combined else None)
 
