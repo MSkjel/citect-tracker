@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
@@ -10,8 +11,10 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QAction,
     QHeaderView,
+    QLineEdit,
     QMenu,
     QTableView,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -151,24 +154,187 @@ def _summarize_new(diff: RecordDiff) -> str:
     return "; ".join(parts)
 
 
+class FilterHeaderView(QHeaderView):
+    """Horizontal header with a QLineEdit filter input embedded under each column label.
+
+    Clicking the label area still sorts; the input sits below the label text.
+    Each input has a small '.*' toggle button on the right edge to enable regex
+    for that field individually. Invalid patterns highlight red and match nothing.
+    """
+
+    filter_changed = pyqtSignal()
+
+    _LABEL_HEIGHT = 20   # pixels reserved for the column label text
+    _INPUT_HEIGHT = 18   # pixels for the embedded QLineEdit
+    _PAD = 1             # gap between label area and input
+    _BTN_W = 24          # width of the per-field .* toggle button
+
+    # col_index -> (field_key, base_label)
+    _COL_FIELDS: dict[int, tuple[str, str]] = {
+        1: ("project",   "Project"),
+        2: ("table",     "Table"),
+        3: ("key",       "Key"),
+        4: ("field",     "Field"),
+        5: ("old_value", "Old value"),
+        6: ("new_value", "New value"),
+    }
+
+    def __init__(self, parent=None):
+        super().__init__(Qt.Orientation.Horizontal, parent)
+        self._inputs: dict[str, QLineEdit] = {}
+        self._col_inputs: dict[int, QLineEdit] = {}
+        self._regex_btns: dict[str, QToolButton] = {}
+
+        total_h = self._LABEL_HEIGHT + self._PAD + self._INPUT_HEIGHT
+        self.setFixedHeight(total_h)
+        self.setDefaultAlignment(Qt.Alignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop))  # type: ignore[arg-type]
+
+        for col, (field, label) in self._COL_FIELDS.items():
+            inp = QLineEdit(self)
+            inp.setPlaceholderText(f"{label}...")
+            inp.setToolTip(
+                f"Filter by {label.lower()}. "
+                "Click .* to enable regex for this field."
+            )
+            inp.setClearButtonEnabled(True)
+            inp.setFrame(False)
+            inp.setTextMargins(0, 0, self._BTN_W + 2, 0)
+            inp.textChanged.connect(self._on_input_changed)
+            inp.hide()  # hidden until _reposition places them correctly
+            self._inputs[field] = inp
+            self._col_inputs[col] = inp
+
+            btn = QToolButton(inp)
+            btn.setText(".*")
+            btn.setCheckable(True)
+            btn.setChecked(False)
+            btn.setFixedSize(self._BTN_W, self._INPUT_HEIGHT)
+            btn.setStyleSheet(
+                "QToolButton { font-size: 10px; padding: 0px; border: none; color: #888; }"
+                "QToolButton:checked { color: #50aaff; font-weight: bold; }"
+            )
+            btn.setCursor(Qt.CursorShape.ArrowCursor)
+            btn.toggled.connect(self._on_input_changed)
+            inp.textChanged.connect(lambda text, b=btn: b.setVisible(not bool(text)))
+            self._regex_btns[field] = btn
+
+        self.sectionResized.connect(self._reposition)
+        self.sectionMoved.connect(self._reposition)
+        self.geometriesChanged.connect(self._reposition)
+
+    # ------------------------------------------------------------------
+    # Qt overrides
+    # ------------------------------------------------------------------
+
+    def showEvent(self, a0) -> None:
+        super().showEvent(a0)
+        self._reposition()
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        hint.setHeight(self._LABEL_HEIGHT + self._PAD + self._INPUT_HEIGHT)
+        return hint
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    @property
+    def regex_fields(self) -> set[str]:
+        """Return the set of field keys that have regex mode enabled."""
+        return {field for field, btn in self._regex_btns.items() if btn.isChecked()}
+
+    @property
+    def field_patterns(self) -> dict[str, str]:
+        return {field: inp.text().strip() for field, inp in self._inputs.items()}
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _reposition(self) -> None:
+        y = self._LABEL_HEIGHT + self._PAD
+        h = self._INPUT_HEIGHT
+        for col, inp in self._col_inputs.items():
+            if self.isSectionHidden(col):
+                inp.hide()
+                continue
+            x = self.sectionViewportPosition(col)
+            w = self.sectionSize(col)
+            inp.setGeometry(x + 1, y, w - 2, h)
+            inp.show()
+            field = self._COL_FIELDS[col][0]
+            btn = self._regex_btns.get(field)
+            if btn is not None:
+                btn.setGeometry(inp.width() - self._BTN_W, 0, self._BTN_W, h)
+
+    def _validate(self) -> None:
+        for field, inp in self._inputs.items():
+            text = inp.text().strip()
+            btn = self._regex_btns.get(field)
+            if btn is not None and btn.isChecked() and text:
+                try:
+                    re.compile(text)
+                    inp.setStyleSheet("")
+                except re.error:
+                    inp.setStyleSheet("QLineEdit { border: 1.5px solid #dc5050; }")
+            else:
+                inp.setStyleSheet("")
+
+    def _on_input_changed(self) -> None:
+        self._validate()
+        self.filter_changed.emit()
+
+
 class DiffFilterProxy(QSortFilterProxyModel):
-    """Proxy model that filters diff rows by search text, change type, and project."""
+    """Proxy model that filters diff rows by per-field patterns, change type, and project.
+
+    Each field (key, project, table, field, old_value, new_value) has its own pattern.
+    All non-empty patterns must match (AND logic).
+    When regex mode is on, each pattern is compiled independently as a regex.
+    Invalid patterns cause that field to match nothing.
+    Plain mode uses case-insensitive substring matching.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._search_text = ""
+        self._field_patterns: dict[str, str] = {}
+        self._regex_fields: set[str] = set()
         self._visible_types: set[str] = {"added", "modified", "deleted"}
         self._project_filter: Optional[set[str]] = None
+        self._compiled: dict[str, Optional[re.Pattern]] = {}
 
-    def set_filter(self, search_text: str, visible_types: set[str]) -> None:
-        self._search_text = search_text.lower()
+    def set_filter(
+        self,
+        field_patterns: dict[str, str],
+        visible_types: set[str],
+        regex_fields: set[str] | None = None,
+    ) -> None:
+        self._field_patterns = field_patterns
         self._visible_types = visible_types
+        self._regex_fields = regex_fields or set()
+        self._compiled = {}
+        for field in self._regex_fields:
+            pattern = field_patterns.get(field, "")
+            if pattern:
+                try:
+                    self._compiled[field] = re.compile(pattern, re.IGNORECASE)
+                except re.error:
+                    self._compiled[field] = None  # Invalid — will match nothing
         self.invalidateFilter()
 
     def set_project_filter(self, projects: Optional[set[str]]) -> None:
         """Set which projects to show (None = all projects)."""
         self._project_filter = projects
         self.invalidateFilter()
+
+    def _matches(self, field: str, pattern: str, candidates: list[str]) -> bool:
+        if field in self._regex_fields:
+            compiled = self._compiled.get(field)
+            if compiled is None:
+                return False
+            return any(compiled.search(c) for c in candidates)
+        return any(pattern.lower() in c.lower() for c in candidates)
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         model = self.sourceModel()
@@ -187,13 +353,23 @@ class DiffFilterProxy(QSortFilterProxyModel):
         if diff.change_type.value not in self._visible_types:
             return False
 
-        # Filter by search text
-        if self._search_text:
-            searchable = (
-                f"{diff.record_key} {diff.project_name} "
-                f"{diff.table_type.value} {' '.join(diff.changed_fields)}"
-            ).lower()
-            if self._search_text not in searchable:
+        # Filter by per-field patterns (all non-empty must match)
+        if not any(self._field_patterns.values()):
+            return True
+
+        field_candidates: dict[str, list[str]] = {
+            "key":       [diff.record_key],
+            "project":   [diff.project_name],
+            "table":     [diff.table_type.value],
+            "field":     diff.changed_fields,
+            "old_value": list((diff.old_fields or {}).values()),
+            "new_value": list((diff.new_fields or {}).values()),
+        }
+
+        for field, pattern in self._field_patterns.items():
+            if not pattern:
+                continue
+            if not self._matches(field, pattern, field_candidates.get(field, [])):
                 return False
 
         return True
@@ -210,19 +386,23 @@ class DiffViewer(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Filter bar
+        # Kept as an attribute so the parent can place it in the summary row
         self.filter_bar = FilterBar()
         self.filter_bar.filter_changed.connect(self._apply_filter)
-        layout.addWidget(self.filter_bar)
 
-        # Table view
+        # Models
         self.model = DiffTableModel()
         self.proxy = DiffFilterProxy()
         self.proxy.setSourceModel(self.model)
 
+        # Table with filter inputs embedded in the header
         self.table = QTableView()
+
+        self.filter_header = FilterHeaderView()
+        self.filter_header.filter_changed.connect(self._apply_filter)
+        self.table.setHorizontalHeader(self.filter_header)
+
         self.table.setModel(self.proxy)
-        self.table.setSortingEnabled(True)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -232,14 +412,25 @@ class DiffViewer(QWidget):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
 
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.filter_header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        self.filter_header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.filter_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        self.filter_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        self.filter_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        self.filter_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.filter_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+
+        # Set up column sorting manually — setSortingEnabled() uses private Qt slots
+        # that don't reliably wire up when the header is replaced after construction.
+        self.filter_header.setSectionsClickable(True)
+        self.filter_header.setSortIndicatorShown(True)
+        # Qt toggles the indicator internally on mouse-release; we just react to the result.
+        self.filter_header.sortIndicatorChanged.connect(self.proxy.sort)
+
+        # Reposition filter inputs when the user scrolls horizontally
+        hbar = self.table.horizontalScrollBar()
+        if hbar is not None:
+            hbar.valueChanged.connect(self.filter_header._reposition)
 
         layout.addWidget(self.table)
 
@@ -291,8 +482,9 @@ class DiffViewer(QWidget):
 
     def _apply_filter(self) -> None:
         self.proxy.set_filter(
-            self.filter_bar.search_text,
+            self.filter_header.field_patterns,
             self.filter_bar.visible_types,
+            self.filter_header.regex_fields,
         )
 
     def set_project_filter(self, projects: Optional[set[str]]) -> None:

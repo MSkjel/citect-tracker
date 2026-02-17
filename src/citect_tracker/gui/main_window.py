@@ -94,17 +94,22 @@ class MainWindow(QMainWindow):
         self.compare_bar.compare_requested.connect(self._on_compare_requested)
         right_layout.addWidget(self.compare_bar)
 
-        # Summary bar
+        # Summary bar + change-type checkboxes on the same row
+        self.diff_viewer = DiffViewer()
+
+        summary_row = QHBoxLayout()
+        summary_row.setContentsMargins(0, 0, 4, 0)
         self.summary_label = QLabel("")
         self.summary_label.setStyleSheet(
-            "QLabel { padding: 6px; font-size: 13px; }"
+            "QLabel { padding: 2px 6px; font-size: 13px; }"
         )
-        right_layout.addWidget(self.summary_label)
+        summary_row.addWidget(self.summary_label)
+        summary_row.addStretch()
+        summary_row.addWidget(self.diff_viewer.filter_bar)
+        right_layout.addLayout(summary_row)
 
         # Right vertical splitter: diff viewer | record detail
         right_splitter = QSplitter(Qt.Orientation.Vertical)
-
-        self.diff_viewer = DiffViewer()
         self.diff_viewer.table.selectionModel().selectionChanged.connect(
             self._on_diff_selection_changed
         )

@@ -1,13 +1,13 @@
-"""Search and filter controls for the diff viewer."""
+"""Change-type filter checkboxes."""
 
 from __future__ import annotations
 
 from PyQt5.QtCore import pyqtSignal
-from PyQt5.QtWidgets import QCheckBox, QHBoxLayout, QLineEdit, QWidget
+from PyQt5.QtWidgets import QCheckBox, QHBoxLayout, QWidget
 
 
 class FilterBar(QWidget):
-    """Search box and change-type toggle checkboxes."""
+    """Slim bar with Added / Modified / Deleted toggle checkboxes."""
 
     filter_changed = pyqtSignal()
 
@@ -16,12 +16,7 @@ class FilterBar(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-
-        self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("Filter by key, project, or table...")
-        self.search_input.setClearButtonEnabled(True)
-        self.search_input.textChanged.connect(self.filter_changed.emit)
-        layout.addWidget(self.search_input, 1)
+        layout.setSpacing(4)
 
         self.show_added = QCheckBox("Added")
         self.show_added.setChecked(True)
@@ -40,10 +35,6 @@ class FilterBar(QWidget):
         self.show_deleted.setStyleSheet("QCheckBox { color: #dc5050; }")
         self.show_deleted.toggled.connect(self.filter_changed.emit)
         layout.addWidget(self.show_deleted)
-
-    @property
-    def search_text(self) -> str:
-        return self.search_input.text().strip().lower()
 
     @property
     def visible_types(self) -> set[str]:
