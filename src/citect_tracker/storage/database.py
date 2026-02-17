@@ -153,6 +153,16 @@ class Database:
             notes=row["notes"] or "",
         )
 
+    def update_snapshot_label(self, snapshot_id: int, label: str) -> None:
+        self.conn.execute(
+            "UPDATE snapshots SET label=? WHERE id=?", (label, snapshot_id)
+        )
+
+    def update_snapshot_notes(self, snapshot_id: int, notes: str) -> None:
+        self.conn.execute(
+            "UPDATE snapshots SET notes=? WHERE id=?", (notes, snapshot_id)
+        )
+
     def list_snapshots(self) -> list[SnapshotMeta]:
         """Return all snapshots, newest first."""
         cur = self.conn.execute("SELECT * FROM snapshots ORDER BY timestamp DESC")

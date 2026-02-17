@@ -2,16 +2,23 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QMenu,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
 
 from ..core.models import ChangeType, RecordDiff
@@ -29,6 +36,78 @@ def _change_color(change_type: ChangeType) -> str:
         return "#dcb432"
     else:
         return "#dc5050"
+
+
+def _setup_table(table: QTableWidget) -> None:
+    """Apply common table settings and clipboard context menu."""
+    table.setColumnCount(3)
+    table.setHorizontalHeaderLabels(["Field", "Old Value", "New Value"])
+    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+    table.setAlternatingRowColors(True)
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+    table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+    table.customContextMenuRequested.connect(lambda pos: _show_copy_menu(table, pos))
+
+
+def _show_copy_menu(table: QTableWidget, pos) -> None:
+    item = table.itemAt(pos)
+    if item is None:
+        return
+    menu = QMenu(table)
+    copy_cell = QAction("Copy cell", table)
+    copy_cell.triggered.connect(lambda: QApplication.clipboard().setText(item.text()))
+    menu.addAction(copy_cell)
+
+    row = item.row()
+    parts = []
+    for col in range(table.columnCount()):
+        cell = table.item(row, col)
+        parts.append(cell.text() if cell else "")
+    copy_row = QAction("Copy row", table)
+    copy_row.triggered.connect(lambda: QApplication.clipboard().setText("\t".join(parts)))
+    menu.addAction(copy_row)
+
+    menu.exec_(table.viewport().mapToGlobal(pos))
+
+
+def _populate_table(
+    table: QTableWidget,
+    diff: RecordDiff,
+    changed_only: bool,
+    changed_first: bool = False,
+) -> None:
+    """Fill table with field comparison rows."""
+    old = diff.old_fields or {}
+    new = diff.new_fields or {}
+    changed_set = set(diff.changed_fields)
+    all_fields = sorted(set(old.keys()) | set(new.keys()))
+
+    if changed_first:
+        ordered = sorted(changed_set) + [f for f in all_fields if f not in changed_set]
+    else:
+        ordered = all_fields
+
+    if changed_only:
+        ordered = [f for f in ordered if f in changed_set or old.get(f) != new.get(f)]
+
+    table.setRowCount(len(ordered))
+    for row, field_name in enumerate(ordered):
+        old_val = old.get(field_name, "")
+        new_val = new.get(field_name, "")
+
+        field_item = QTableWidgetItem(field_name)
+        old_item = QTableWidgetItem(old_val)
+        new_item = QTableWidgetItem(new_val)
+
+        if field_name in changed_set or old_val != new_val:
+            field_item.setForeground(_CHANGED_FG)
+            old_item.setForeground(_OLD_FG)
+            new_item.setForeground(_NEW_FG)
+
+        table.setItem(row, 0, field_item)
+        table.setItem(row, 1, old_item)
+        table.setItem(row, 2, new_item)
 
 
 class RecordDetailDialog(QDialog):
@@ -66,90 +145,63 @@ class RecordDetailDialog(QDialog):
         key_label.setStyleSheet("font-weight: bold; font-size: 13px;")
         layout.addWidget(key_label)
 
+        # "Changed fields only" toggle
+        self._changed_only_cb = QCheckBox("Changed fields only")
+        self._changed_only_cb.toggled.connect(self._repopulate)
+        layout.addWidget(self._changed_only_cb)
+
         # Field comparison table
         self.table = QTableWidget()
-        self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["Field", "Old Value", "New Value"])
-        self.table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        _setup_table(self.table)
         layout.addWidget(self.table)
 
-        self._populate_table()
+        self._repopulate()
 
-    def _populate_table(self) -> None:
-        old = self.diff.old_fields or {}
-        new = self.diff.new_fields or {}
-        all_fields = sorted(set(old.keys()) | set(new.keys()))
-
-        self.table.setRowCount(len(all_fields))
-
-        for row, field_name in enumerate(all_fields):
-            old_val = old.get(field_name, "")
-            new_val = new.get(field_name, "")
-
-            field_item = QTableWidgetItem(field_name)
-            old_item = QTableWidgetItem(old_val)
-            new_item = QTableWidgetItem(new_val)
-
-            # Highlight changed fields with text color (works on any bg)
-            if field_name in self.diff.changed_fields or old_val != new_val:
-                field_item.setForeground(_CHANGED_FG)
-                old_item.setForeground(_OLD_FG)
-                new_item.setForeground(_NEW_FG)
-
-            self.table.setItem(row, 0, field_item)
-            self.table.setItem(row, 1, old_item)
-            self.table.setItem(row, 2, new_item)
+    def _repopulate(self) -> None:
+        _populate_table(
+            self.table,
+            self.diff,
+            changed_only=self._changed_only_cb.isChecked(),
+        )
 
 
-class RecordDetailPanel(QTableWidget):
-    """Inline table below the diff viewer showing field-level changes.
+class RecordDetailPanel(QWidget):
+    """Inline panel below the diff viewer showing field-level changes.
 
     When a record is selected in the diff table, this shows all fields
-    with old and new values side by side.
+    with old and new values side by side. Changed fields are shown first.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setColumnCount(3)
-        self.setHorizontalHeaderLabels(["Field", "Old Value", "New Value"])
-        self.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.setAlternatingRowColors(True)
-        self.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.clear_detail()
+        self._last_diff: Optional[RecordDiff] = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+
+        self._changed_only_cb = QCheckBox("Changed fields only")
+        self._changed_only_cb.toggled.connect(self._repopulate)
+        layout.addWidget(self._changed_only_cb)
+
+        self._table = QTableWidget()
+        _setup_table(self._table)
+        layout.addWidget(self._table)
 
     def clear_detail(self) -> None:
-        self.setRowCount(0)
+        self._last_diff = None
+        self._table.setRowCount(0)
 
     def show_diff(self, diff: RecordDiff) -> None:
-        old = diff.old_fields or {}
-        new = diff.new_fields or {}
+        self._last_diff = diff
+        self._repopulate()
 
-        # Show changed fields first, then unchanged
-        changed_set = set(diff.changed_fields)
-        all_fields = sorted(set(old.keys()) | set(new.keys()))
-        changed_first = sorted(changed_set) + [f for f in all_fields if f not in changed_set]
-
-        self.setRowCount(len(changed_first))
-
-        for row, field_name in enumerate(changed_first):
-            old_val = old.get(field_name, "")
-            new_val = new.get(field_name, "")
-
-            field_item = QTableWidgetItem(field_name)
-            old_item = QTableWidgetItem(old_val)
-            new_item = QTableWidgetItem(new_val)
-
-            if field_name in changed_set or old_val != new_val:
-                field_item.setForeground(_CHANGED_FG)
-                old_item.setForeground(_OLD_FG)
-                new_item.setForeground(_NEW_FG)
-
-            self.setItem(row, 0, field_item)
-            self.setItem(row, 1, old_item)
-            self.setItem(row, 2, new_item)
+    def _repopulate(self) -> None:
+        if self._last_diff is None:
+            return
+        _populate_table(
+            self._table,
+            self._last_diff,
+            changed_only=self._changed_only_cb.isChecked(),
+            changed_first=True,
+        )

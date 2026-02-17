@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import csv
 import re
 from typing import Optional
 
 from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QKeySequence, QTextDocument
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QAction,
+    QApplication,
     QHeaderView,
     QLineEdit,
     QMenu,
+    QShortcut,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableView,
     QToolButton,
     QVBoxLayout,
@@ -28,6 +34,86 @@ TYPE_COLORS = {
     ChangeType.MODIFIED: QColor(220, 180, 50),   # Amber
     ChangeType.DELETED: QColor(220, 80, 80),     # Red
 }
+
+# Maps table column index → DiffFilterProxy field key (used by HighlightDelegate)
+_COL_FIELD: dict[int, str] = {
+    1: "project",
+    2: "table",
+    3: "key",
+    4: "field",
+    5: "old_value",
+    6: "new_value",
+}
+
+
+class HighlightDelegate(QStyledItemDelegate):
+    """Draws cells normally, then overlays amber highlights on matched text."""
+
+    def __init__(self, proxy: "DiffFilterProxy", parent=None):
+        super().__init__(parent)
+        self._proxy = proxy
+
+    def paint(self, painter, option, index) -> None:  # type: ignore[override]
+        if painter is None:
+            return
+        col = index.column()
+        field = _COL_FIELD.get(col)
+        text: str = index.data(Qt.ItemDataRole.DisplayRole) or ""
+        pattern: str = self._proxy._field_patterns.get(field, "").strip() if field else ""
+
+        if not pattern or not text:
+            super().paint(painter, option, index)
+            return
+
+        # Find match spans
+        if field in self._proxy._regex_fields:
+            compiled = self._proxy._compiled.get(field)
+            if compiled is None:
+                super().paint(painter, option, index)
+                return
+            spans = [(m.start(), m.end()) for m in compiled.finditer(text)]
+        else:
+            spans: list[tuple[int, int]] = []
+            lower, pl = text.lower(), pattern.lower()
+            start = 0
+            while (pos := lower.find(pl, start)) != -1:
+                spans.append((pos, pos + len(pl)))
+                start = pos + len(pl)
+
+        if not spans:
+            super().paint(painter, option, index)
+            return
+
+        # Build HTML: preserve ForegroundRole colour, highlight spans in amber
+        def esc(s: str) -> str:
+            return s.replace("&", "&amp;").replace("<", "&lt;")
+
+        fg = index.data(Qt.ItemDataRole.ForegroundRole)
+        color_style = f"color:{fg.name()};" if fg else ""
+        parts: list[str] = []
+        prev = 0
+        for s, e in spans:
+            parts.append(f'<span style="{color_style}">{esc(text[prev:s])}</span>')
+            parts.append(f'<span style="background:#c8a000;color:#000;">{esc(text[s:e])}</span>')
+            prev = e
+        parts.append(f'<span style="{color_style}">{esc(text[prev:])}</span>')
+
+        # Draw the cell background / selection state without text
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        style = QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter)
+
+        # Render highlighted HTML into the text rect
+        text_rect = style.subElementRect(QStyle.SubElement.SE_ItemViewItemText, opt)
+        doc = QTextDocument()
+        doc.setDefaultFont(opt.font)
+        doc.setHtml("".join(parts))
+        painter.save()
+        painter.translate(text_rect.topLeft())
+        doc.drawContents(painter)
+        painter.restore()
 
 
 class DiffTableModel(QAbstractTableModel):
@@ -432,6 +518,13 @@ class DiffViewer(QWidget):
         if hbar is not None:
             hbar.valueChanged.connect(self.filter_header._reposition)
 
+        # Highlight matched filter text in cells
+        self.table.setItemDelegate(HighlightDelegate(self.proxy))
+
+        # Keyboard row navigation
+        QShortcut(QKeySequence("Ctrl+Down"), self.table).activated.connect(self._go_next)
+        QShortcut(QKeySequence("Ctrl+Up"), self.table).activated.connect(self._go_prev)
+
         layout.addWidget(self.table)
 
     def set_diff_summary(self, summary: DiffSummary) -> None:
@@ -486,6 +579,36 @@ class DiffViewer(QWidget):
             self.filter_bar.visible_types,
             self.filter_header.regex_fields,
         )
+        vp = self.table.viewport()
+        if vp is not None:
+            vp.update()
+
+    def export_to_csv(self, file_path: str) -> None:
+        """Export the current filtered/sorted diff view to a CSV file."""
+        with open(file_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(DiffTableModel.COLUMNS)
+            for row in range(self.proxy.rowCount()):
+                writer.writerow([
+                    self.proxy.data(self.proxy.index(row, col), Qt.ItemDataRole.DisplayRole) or ""
+                    for col in range(self.proxy.columnCount())
+                ])
+
+    def _go_next(self) -> None:
+        n = self.proxy.rowCount()
+        if not n:
+            return
+        row = (self.table.currentIndex().row() + 1) % n
+        self.table.selectRow(row)
+        self.table.scrollTo(self.proxy.index(row, 0))
+
+    def _go_prev(self) -> None:
+        n = self.proxy.rowCount()
+        if not n:
+            return
+        row = (self.table.currentIndex().row() - 1) % n
+        self.table.selectRow(row)
+        self.table.scrollTo(self.proxy.index(row, 0))
 
     def set_project_filter(self, projects: Optional[set[str]]) -> None:
         """Filter diff view to only show specified projects."""

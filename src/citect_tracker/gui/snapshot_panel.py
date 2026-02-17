@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
+    QAction,
     QComboBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -24,6 +27,8 @@ class SnapshotPanel(QWidget):
     take_snapshot_requested = pyqtSignal()
     compare_requested = pyqtSignal(int, int)  # old_id, new_id
     delete_requested = pyqtSignal(int)  # snapshot_id
+    rename_requested = pyqtSignal(int, str)   # snapshot_id, new_label
+    notes_changed = pyqtSignal(int, str)       # snapshot_id, new_notes
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -42,6 +47,9 @@ class SnapshotPanel(QWidget):
         self.snapshot_list.setSelectionMode(
             QListWidget.SelectionMode.SingleSelection
         )
+        self.snapshot_list.itemDoubleClicked.connect(self._on_rename)
+        self.snapshot_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.snapshot_list.customContextMenuRequested.connect(self._on_context_menu)
         layout.addWidget(self.snapshot_list)
 
         # Delete button
@@ -65,13 +73,17 @@ class SnapshotPanel(QWidget):
         self.snapshot_list.clear()
 
         for snap in snapshots:
-            text = (
-                f"{snap.timestamp.strftime('%Y-%m-%d %H:%M')} | "
-                f"{snap.label}\n"
-                f"  {snap.project_count} projects, "
-                f"{snap.total_records:,} records"
-            )
-            item = QListWidgetItem(text)
+            lines = [
+                f"{snap.timestamp.strftime('%Y-%m-%d %H:%M')} | {snap.label}",
+                f"  {snap.project_count} projects, {snap.total_records:,} records",
+            ]
+            if snap.notes:
+                first_line = snap.notes.split("\n")[0]
+                suffix = "…" if "\n" in snap.notes or len(first_line) > 60 else ""
+                if len(first_line) > 60:
+                    first_line = first_line[:60]
+                lines.append(f"  Note: {first_line}{suffix}")
+            item = QListWidgetItem("\n".join(lines))
             item.setData(256, snap.snapshot_id)  # UserRole
             self.snapshot_list.addItem(item)
 
@@ -80,6 +92,44 @@ class SnapshotPanel(QWidget):
         if items:
             return items[0].data(256)
         return None
+
+    def _get_snapshot_meta(self, snapshot_id: int) -> SnapshotMeta | None:
+        for snap in self._snapshots:
+            if snap.snapshot_id == snapshot_id:
+                return snap
+        return None
+
+    def _on_rename(self, item: QListWidgetItem) -> None:
+        sid = item.data(256)
+        snap = self._get_snapshot_meta(sid)
+        current_label = snap.label if snap else ""
+        new_label, ok = QInputDialog.getText(
+            self, "Edit Label", "Snapshot label:", text=current_label
+        )
+        if ok:
+            self.rename_requested.emit(sid, new_label)
+
+    def _on_edit_notes(self) -> None:
+        sid = self.get_selected_snapshot_id()
+        if sid is None:
+            return
+        snap = self._get_snapshot_meta(sid)
+        current_notes = snap.notes if snap else ""
+        new_notes, ok = QInputDialog.getMultiLineText(
+            self, "Edit Notes", "Notes:", text=current_notes
+        )
+        if ok:
+            self.notes_changed.emit(sid, new_notes)
+
+    def _on_context_menu(self, pos) -> None:
+        if self.get_selected_snapshot_id() is None:
+            return
+        menu = QMenu(self)
+        menu.addAction(QAction("Edit label", self, triggered=lambda: self._on_rename(
+            self.snapshot_list.currentItem()
+        )))
+        menu.addAction(QAction("Edit notes", self, triggered=self._on_edit_notes))
+        menu.exec_(self.snapshot_list.mapToGlobal(pos))
 
     def _on_delete(self) -> None:
         sid = self.get_selected_snapshot_id()

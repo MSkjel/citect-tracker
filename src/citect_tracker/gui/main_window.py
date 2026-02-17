@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QSettings, Qt
+from PyQt5.QtCore import QByteArray, QSettings, Qt, QTimer
 from PyQt5.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -57,8 +57,8 @@ class MainWindow(QMainWindow):
         main_layout = QHBoxLayout(central)
 
         # Main splitter: left panel | right panel
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        main_layout.addWidget(splitter)
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_layout.addWidget(self.main_splitter)
 
         # -- Left panel --
         left_widget = QWidget()
@@ -66,7 +66,8 @@ class MainWindow(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
 
         # Left vertical splitter: project tree | snapshot panel
-        left_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.left_splitter = QSplitter(Qt.Orientation.Vertical)
+        left_splitter = self.left_splitter
 
         self.project_tree = ProjectTree()
         self.project_tree.project_filter_changed.connect(self._on_project_filter_changed)
@@ -78,11 +79,13 @@ class MainWindow(QMainWindow):
         self.snapshot_panel = SnapshotPanel()
         self.snapshot_panel.take_snapshot_requested.connect(self._take_snapshot)
         self.snapshot_panel.delete_requested.connect(self._delete_snapshot)
+        self.snapshot_panel.rename_requested.connect(self._rename_snapshot)
+        self.snapshot_panel.notes_changed.connect(self._edit_snapshot_notes)
         left_splitter.addWidget(self.snapshot_panel)
 
         left_splitter.setSizes([400, 300])
         left_layout.addWidget(left_splitter)
-        splitter.addWidget(left_widget)
+        self.main_splitter.addWidget(left_widget)
 
         # -- Right panel --
         right_widget = QWidget()
@@ -109,7 +112,8 @@ class MainWindow(QMainWindow):
         right_layout.addLayout(summary_row)
 
         # Right vertical splitter: diff viewer | record detail
-        right_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical)
+        right_splitter = self.right_splitter
         self.diff_viewer.table.selectionModel().selectionChanged.connect(
             self._on_diff_selection_changed
         )
@@ -123,12 +127,36 @@ class MainWindow(QMainWindow):
         right_splitter.setSizes([500, 100])
         right_layout.addWidget(right_splitter)
 
-        splitter.addWidget(right_widget)
-        splitter.setSizes([300, 900])
+        self.main_splitter.addWidget(right_widget)
+        self.main_splitter.setSizes([300, 900])
 
         # Status bar
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
+
+        # Restore geometry and splitter positions
+        s = QSettings()
+        geom = s.value("window/geometry")
+        if geom is not None:
+            self.restoreGeometry(geom if isinstance(geom, QByteArray) else QByteArray(geom))
+        for key, widget in [
+            ("splitter/main", self.main_splitter),
+            ("splitter/left", self.left_splitter),
+            ("splitter/right", self.right_splitter),
+            ("header/diff_table", self.diff_viewer.filter_header),
+        ]:
+            val = s.value(key)
+            if val is not None:
+                widget.restoreState(val if isinstance(val, QByteArray) else QByteArray(val))
+
+    def closeEvent(self, event) -> None:
+        s = QSettings()
+        s.setValue("window/geometry", self.saveGeometry())
+        s.setValue("splitter/main", self.main_splitter.saveState())
+        s.setValue("splitter/left", self.left_splitter.saveState())
+        s.setValue("splitter/right", self.right_splitter.saveState())
+        s.setValue("header/diff_table", self.diff_viewer.filter_header.saveState())
+        super().closeEvent(event)
 
     def _setup_menu(self) -> None:
         menu_bar = self.menuBar()
@@ -136,6 +164,8 @@ class MainWindow(QMainWindow):
         file_menu = menu_bar.addMenu("&File")
         file_menu.addAction("&Open DBF Directory...", self._open_directory)
         file_menu.addAction("&Take Snapshot", self._take_snapshot)
+        file_menu.addSeparator()
+        file_menu.addAction("&Export Diff to CSV...", self._export_diff_csv)
         file_menu.addSeparator()
         file_menu.addAction("&Quit", self.close)
 
@@ -154,6 +184,11 @@ class MainWindow(QMainWindow):
         self.status_bar.showMessage(
             f"{len(snapshots)} snapshot(s) available"
         )
+
+        if len(snapshots) >= 2:
+            QTimer.singleShot(0, lambda: self._compare_snapshots(
+                snapshots[1].snapshot_id, snapshots[0].snapshot_id
+            ))
 
     def _load_project_tree(self) -> None:
         """Load project hierarchy from the source directory."""
@@ -478,6 +513,21 @@ class MainWindow(QMainWindow):
         worker.error.connect(on_error)
         self._active_worker = worker
         worker.start()
+
+    def _rename_snapshot(self, snapshot_id: int, new_label: str) -> None:
+        self.db.update_snapshot_label(snapshot_id, new_label)
+        self._refresh_snapshots()
+
+    def _edit_snapshot_notes(self, snapshot_id: int, new_notes: str) -> None:
+        self.db.update_snapshot_notes(snapshot_id, new_notes)
+        self._refresh_snapshots()
+
+    def _export_diff_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Diff to CSV", "", "CSV Files (*.csv)"
+        )
+        if path:
+            self.diff_viewer.export_to_csv(path)
 
     def _show_about(self) -> None:
         QMessageBox.about(
