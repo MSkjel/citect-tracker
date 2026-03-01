@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import getpass
 import sys
 from pathlib import Path
 
@@ -60,13 +61,45 @@ def main() -> None:
     # Save the directory for next launch
     settings.setValue("last_dbf_directory", str(source_dir))
 
-    # Open database alongside the source directory
-    db_path = source_dir / "citect_tracker.db"
+    # Resolve database path
+    saved_db = settings.value("db_path", "")
+    db_path = None
+
+    if saved_db:
+        candidate = Path(saved_db)
+        if candidate.exists():
+            db_path = candidate
+        else:
+            QMessageBox.warning(
+                None,
+                "Database Not Found",
+                f"The database file could not be found:\n{saved_db}\n\n"
+                "Please select an existing database or create a new one.",
+            )
+
+    if db_path is None:
+        path, _ = QFileDialog.getSaveFileName(
+            None,
+            "Open / Create Tracker Database",
+            str(source_dir) if source_dir else "",
+            "SQLite Database (*.db)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not path:
+            sys.exit(0)
+        db_path = Path(path)
+        if db_path.suffix.lower() != ".db":
+            db_path = db_path.with_suffix(".db")
+        settings.setValue("db_path", str(db_path))
+
+    # Resolve username: use saved name if set, else OS login
+    user_name = settings.value("user_name", "") or getpass.getuser()
+
     db = Database(db_path)
     db.connect()
 
     try:
-        window = MainWindow(db, source_dir)
+        window = MainWindow(db, source_dir, user_name=user_name)
         window.show()
         exit_code = app.exec()
     finally:

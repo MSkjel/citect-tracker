@@ -39,6 +39,7 @@ class SnapshotEngine:
         label: str = "",
         progress_callback: ProgressCallback = None,
         excluded_projects: set[str] | None = None,
+        taken_by: str = "",
     ) -> SnapshotMeta:
         """Take a complete snapshot of all projects and their data tables.
 
@@ -79,6 +80,7 @@ class SnapshotEngine:
                 label=label,
                 source_dir=str(source_dir),
                 project_count=len(projects),
+                taken_by=taken_by,
             )
 
             # Store project metadata

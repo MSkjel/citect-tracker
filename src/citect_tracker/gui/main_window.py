@@ -35,21 +35,26 @@ from .workers import DiffWorker, RecoverWorker, SnapshotWorker
 class MainWindow(QMainWindow):
     """Main application window."""
 
-    def __init__(self, db: Database, source_dir: Optional[Path] = None):
+    def __init__(self, db: Database, source_dir: Optional[Path] = None, user_name: str = ""):
         super().__init__()
         self.db = db
         self.source_dir = source_dir
+        self._user_name = user_name
         self.snapshot_engine = SnapshotEngine(db)
         self.diff_engine = DiffEngine(db)
         self._current_diff: Optional[DiffSummary] = None
         self._active_worker: Optional[SnapshotWorker | DiffWorker] = None
         self._project_filter: Optional[set[str]] = None
 
-        self.setWindowTitle("Citect Tracker")
         self.setMinimumSize(1200, 700)
         self._setup_ui()
         self._setup_menu()
         self._load_initial_data()
+        self._update_window_title()
+
+    def _update_window_title(self) -> None:
+        db_name = self.db.db_path.name
+        self.setWindowTitle(f"Citect Tracker — {db_name}  [{self._user_name}]")
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -163,9 +168,13 @@ class MainWindow(QMainWindow):
 
         file_menu = menu_bar.addMenu("&File")
         file_menu.addAction("&Open DBF Directory...", self._open_directory)
+        file_menu.addAction("Open &Database...", self._open_database)
+        file_menu.addSeparator()
         file_menu.addAction("&Take Snapshot", self._take_snapshot)
         file_menu.addSeparator()
         file_menu.addAction("&Export Diff to CSV...", self._export_diff_csv)
+        file_menu.addSeparator()
+        file_menu.addAction("Change &User Name...", self._change_user_name)
         file_menu.addSeparator()
         file_menu.addAction("&Quit", self.close)
 
@@ -234,6 +243,46 @@ class MainWindow(QMainWindow):
             self._load_project_tree()
             self.status_bar.showMessage(f"Loaded: {dir_path}")
 
+    def _open_database(self) -> None:
+        """Open (or create) a shared tracker database file."""
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Open / Create Tracker Database",
+            "",
+            "SQLite Database (*.db)",
+            options=QFileDialog.Option.DontConfirmOverwrite,
+        )
+        if not path:
+            return
+        db_path = Path(path)
+        if db_path.suffix.lower() != ".db":
+            db_path = db_path.with_suffix(".db")
+        self.db.close()
+        self.db = Database(db_path)
+        self.db.connect()
+        self.snapshot_engine = SnapshotEngine(self.db)
+        self.diff_engine = DiffEngine(self.db)
+        QSettings().setValue("db_path", str(db_path))
+        self._update_window_title()
+        self._current_diff = None
+        self.diff_viewer.clear()
+        self.record_detail.clear_detail()
+        self.summary_label.setText("")
+        self.project_tree.clear_change_indicators()
+        self._load_initial_data()
+        self.status_bar.showMessage(f"Database: {db_path}")
+
+    def _change_user_name(self) -> None:
+        """Prompt the user to change their display name."""
+        new_name, ok = QInputDialog.getText(
+            self, "Change User Name", "Your name:", text=self._user_name
+        )
+        if ok and new_name.strip():
+            self._user_name = new_name.strip()
+            QSettings().setValue("user_name", self._user_name)
+            self._update_window_title()
+            self.status_bar.showMessage(f"User name set to: {self._user_name}")
+
     def _take_snapshot(self) -> None:
         """Take a new snapshot of the current DBF data."""
         if not self.source_dir:
@@ -261,6 +310,7 @@ class MainWindow(QMainWindow):
             self.source_dir,
             label=label,
             excluded_projects=excluded or None,
+            taken_by=self._user_name,
             parent=self,
         )
 

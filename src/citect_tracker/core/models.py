@@ -78,6 +78,7 @@ class SnapshotMeta:
     project_count: int
     total_records: int
     notes: str = ""
+    taken_by: str = ""
 
 
 @dataclass

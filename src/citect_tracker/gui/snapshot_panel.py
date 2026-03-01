@@ -73,8 +73,11 @@ class SnapshotPanel(QWidget):
         self.snapshot_list.clear()
 
         for snap in snapshots:
+            header = f"{snap.timestamp.strftime('%Y-%m-%d %H:%M')} | {snap.label}"
+            if snap.taken_by:
+                header += f"  (by {snap.taken_by})"
             lines = [
-                f"{snap.timestamp.strftime('%Y-%m-%d %H:%M')} | {snap.label}",
+                header,
                 f"  {snap.project_count} projects, {snap.total_records:,} records",
             ]
             if snap.notes:

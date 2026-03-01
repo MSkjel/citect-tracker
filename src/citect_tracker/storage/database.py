@@ -17,7 +17,7 @@ from ..core.models import (
     TableType,
 )
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -31,7 +31,8 @@ CREATE TABLE IF NOT EXISTS snapshots (
     source_dir      TEXT NOT NULL,
     project_count   INTEGER NOT NULL DEFAULT 0,
     total_records   INTEGER NOT NULL DEFAULT 0,
-    notes           TEXT DEFAULT ''
+    notes           TEXT DEFAULT '',
+    taken_by        TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS snapshot_projects (
@@ -113,6 +114,15 @@ class Database:
             self.conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
             )
+        else:
+            current_version = row["version"]
+            if current_version < 4:
+                self.conn.execute(
+                    "ALTER TABLE snapshots ADD COLUMN taken_by TEXT DEFAULT ''"
+                )
+                self.conn.execute(
+                    "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
+                )
         self.conn.commit()
 
     # -- Snapshot CRUD --
@@ -123,12 +133,13 @@ class Database:
         label: str,
         source_dir: str,
         project_count: int,
+        taken_by: str = "",
     ) -> int:
         """Create a new snapshot and return its ID."""
         cur = self.conn.execute(
-            "INSERT INTO snapshots (timestamp, label, source_dir, project_count) "
-            "VALUES (?, ?, ?, ?)",
-            (timestamp.isoformat(), label, source_dir, project_count),
+            "INSERT INTO snapshots (timestamp, label, source_dir, project_count, taken_by) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (timestamp.isoformat(), label, source_dir, project_count, taken_by),
         )
         return cur.lastrowid  # type: ignore[return-value]
 
@@ -151,6 +162,7 @@ class Database:
             project_count=row["project_count"],
             total_records=row["total_records"],
             notes=row["notes"] or "",
+            taken_by=row["taken_by"] or "",
         )
 
     def update_snapshot_label(self, snapshot_id: int, label: str) -> None:
@@ -175,6 +187,7 @@ class Database:
                 project_count=row["project_count"],
                 total_records=row["total_records"],
                 notes=row["notes"] or "",
+                taken_by=row["taken_by"] or "",
             )
             for row in cur.fetchall()
         ]

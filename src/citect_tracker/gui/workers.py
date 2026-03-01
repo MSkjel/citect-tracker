@@ -30,6 +30,7 @@ class SnapshotWorker(QThread):
         source_dir: Path,
         label: str = "",
         excluded_projects: Optional[set[str]] = None,
+        taken_by: str = "",
         parent=None,
     ):
         super().__init__(parent)
@@ -37,6 +38,7 @@ class SnapshotWorker(QThread):
         self.source_dir = source_dir
         self.label = label
         self.excluded_projects = excluded_projects
+        self.taken_by = taken_by
 
     def run(self) -> None:
         try:
@@ -49,6 +51,7 @@ class SnapshotWorker(QThread):
                     label=self.label,
                     progress_callback=self._on_progress,
                     excluded_projects=self.excluded_projects,
+                    taken_by=self.taken_by,
                 )
                 self.finished.emit(meta)
             finally:
