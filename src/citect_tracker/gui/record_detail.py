@@ -42,7 +42,9 @@ def _setup_table(table: QTableWidget) -> None:
     """Apply common table settings and clipboard context menu."""
     table.setColumnCount(3)
     table.setHorizontalHeaderLabels(["Field", "Old Value", "New Value"])
-    table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+    header = table.horizontalHeader()
+    assert header is not None
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
     table.setAlternatingRowColors(True)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -56,7 +58,9 @@ def _show_copy_menu(table: QTableWidget, pos) -> None:
         return
     menu = QMenu(table)
     copy_cell = QAction("Copy cell", table)
-    copy_cell.triggered.connect(lambda: QApplication.clipboard().setText(item.text()))
+    cb = QApplication.clipboard()
+    assert cb is not None
+    copy_cell.triggered.connect(lambda: cb.setText(item.text()))
     menu.addAction(copy_cell)
 
     row = item.row()
@@ -65,10 +69,12 @@ def _show_copy_menu(table: QTableWidget, pos) -> None:
         cell = table.item(row, col)
         parts.append(cell.text() if cell else "")
     copy_row = QAction("Copy row", table)
-    copy_row.triggered.connect(lambda: QApplication.clipboard().setText("\t".join(parts)))
+    copy_row.triggered.connect(lambda: cb.setText("\t".join(parts)))
     menu.addAction(copy_row)
 
-    menu.exec_(table.viewport().mapToGlobal(pos))
+    vp = table.viewport()
+    if vp is not None:
+        menu.exec_(vp.mapToGlobal(pos))
 
 
 def _populate_table(

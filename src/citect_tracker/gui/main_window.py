@@ -43,8 +43,9 @@ class MainWindow(QMainWindow):
         self.snapshot_engine = SnapshotEngine(db)
         self.diff_engine = DiffEngine(db)
         self._current_diff: Optional[DiffSummary] = None
-        self._active_worker: Optional[SnapshotWorker | DiffWorker] = None
+        self._active_worker: Optional[SnapshotWorker | DiffWorker | RecoverWorker] = None
         self._project_filter: Optional[set[str]] = None
+        self._snapshots: list[SnapshotMeta] = []
 
         self.setMinimumSize(1200, 700)
         self._setup_ui()
@@ -119,9 +120,9 @@ class MainWindow(QMainWindow):
         # Right vertical splitter: diff viewer | record detail
         self.right_splitter = QSplitter(Qt.Orientation.Vertical)
         right_splitter = self.right_splitter
-        self.diff_viewer.table.selectionModel().selectionChanged.connect(
-            self._on_diff_selection_changed
-        )
+        diff_sel = self.diff_viewer.table.selectionModel()
+        assert diff_sel is not None
+        diff_sel.selectionChanged.connect(self._on_diff_selection_changed)
         self.diff_viewer.table.doubleClicked.connect(self._on_diff_double_clicked)
         self.diff_viewer.recover_requested.connect(self._on_recover_requested)
         right_splitter.addWidget(self.diff_viewer)
@@ -154,19 +155,21 @@ class MainWindow(QMainWindow):
             if val is not None:
                 widget.restoreState(val if isinstance(val, QByteArray) else QByteArray(val))
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, a0) -> None:  # type: ignore[override]
         s = QSettings()
         s.setValue("window/geometry", self.saveGeometry())
         s.setValue("splitter/main", self.main_splitter.saveState())
         s.setValue("splitter/left", self.left_splitter.saveState())
         s.setValue("splitter/right", self.right_splitter.saveState())
         s.setValue("header/diff_table", self.diff_viewer.filter_header.saveState())
-        super().closeEvent(event)
+        super().closeEvent(a0)
 
     def _setup_menu(self) -> None:
         menu_bar = self.menuBar()
+        assert menu_bar is not None
 
         file_menu = menu_bar.addMenu("&File")
+        assert file_menu is not None
         file_menu.addAction("&Open DBF Directory...", self._open_directory)
         file_menu.addAction("Open &Database...", self._open_database)
         file_menu.addSeparator()
@@ -179,11 +182,13 @@ class MainWindow(QMainWindow):
         file_menu.addAction("&Quit", self.close)
 
         help_menu = menu_bar.addMenu("&Help")
+        assert help_menu is not None
         help_menu.addAction("&About", self._show_about)
 
     def _load_initial_data(self) -> None:
         """Load snapshots and project tree on startup."""
         snapshots = self.snapshot_engine.list_snapshots()
+        self._snapshots = snapshots
         self.snapshot_panel.set_snapshots(snapshots)
         self.compare_bar.set_snapshots(snapshots)
 
@@ -372,6 +377,7 @@ class MainWindow(QMainWindow):
     def _refresh_snapshots(self) -> None:
         """Reload snapshot lists."""
         snapshots = self.snapshot_engine.list_snapshots()
+        self._snapshots = snapshots
         self.snapshot_panel.set_snapshots(snapshots)
         self.compare_bar.set_snapshots(snapshots)
 
@@ -386,11 +392,28 @@ class MainWindow(QMainWindow):
         self.summary_label.setText("")
 
         excluded = self.project_tree.get_excluded_projects()
+
+        # Determine snapshots between old and new (oldest first) for snapshot labelling
+        id_to_snap = {s.snapshot_id: s for s in self._snapshots}
+        old_snap = id_to_snap.get(old_id)
+        new_snap = id_to_snap.get(new_id)
+        intermediates: Optional[list[SnapshotMeta]] = None
+        if old_snap and new_snap:
+            old_ts = min(old_snap.timestamp, new_snap.timestamp)
+            new_ts = max(old_snap.timestamp, new_snap.timestamp)
+            between = sorted(
+                (s for s in self._snapshots if old_ts <= s.timestamp <= new_ts),
+                key=lambda s: s.timestamp,
+            )
+            if len(between) >= 2:
+                intermediates = between
+
         worker = DiffWorker(
             self.db.db_path,
             old_id,
             new_id,
             excluded_projects=excluded or None,
+            intermediate_snapshots=intermediates,
             parent=self,
         )
 
@@ -505,7 +528,7 @@ class MainWindow(QMainWindow):
             f"This will modify {len(diffs)} record(s) in the DBF files "
             f"on disk:\n\n" + "\n".join(lines) + "\n\n"
             "This cannot be undone. Continue?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,  # type: ignore[arg-type]
             QMessageBox.StandardButton.No,
         )
         if reply != QMessageBox.StandardButton.Yes:

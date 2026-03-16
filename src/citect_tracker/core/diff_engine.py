@@ -21,6 +21,7 @@ class DiffEngine:
         project_filter: Optional[set[str]] = None,
         table_filter: Optional[TableType] = None,
         excluded_projects: Optional[set[str]] = None,
+        intermediate_snapshots: Optional[list] = None,
     ) -> DiffSummary:
         """Compare two snapshots and return all differences.
 
@@ -101,6 +102,40 @@ class DiffEngine:
                 deleted += 1
 
             changes_by_project[project][table].append(diff)
+
+        # Tag each diff with the snapshot where that change last appeared.
+        # If intermediate snapshots are provided, do sequential pairwise find_changes
+        # (hash-only, no field fetches) to build a key→label map.
+        all_diffs = [
+            d
+            for tables in changes_by_project.values()
+            for diffs in tables.values()
+            for d in diffs
+        ]
+        def _fmt(snap) -> str:  # type: ignore[no-untyped-def]
+            return f"{snap.timestamp.strftime('%Y-%m-%d %H:%M')} | {snap.label}"
+
+        if intermediate_snapshots and len(intermediate_snapshots) >= 2:
+            key_to_label: dict[tuple[str, str, str], str] = {}
+            for i in range(len(intermediate_snapshots) - 1):
+                pair_old_id = intermediate_snapshots[i].snapshot_id
+                pair_new_id = intermediate_snapshots[i + 1].snapshot_id
+                pair_label = _fmt(intermediate_snapshots[i + 1])
+                pair_changes = self.db.find_changes(
+                    pair_old_id, pair_new_id, project_filter, table_filter
+                )
+                for c in pair_changes:
+                    if excluded_projects and c["project_name"] in excluded_projects:
+                        continue
+                    key_to_label[(c["project_name"], c["table_type"], c["record_key"])] = pair_label
+            for diff in all_diffs:
+                diff.snapshot_label = key_to_label.get(
+                    (diff.project_name, diff.table_type.value, diff.record_key),
+                    _fmt(new_meta),
+                )
+        else:
+            for diff in all_diffs:
+                diff.snapshot_label = _fmt(new_meta)
 
         return DiffSummary(
             old_snapshot=old_meta,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import csv
 import re
-from typing import Optional
+from typing import Optional, cast
 
 from PyQt5.QtCore import QAbstractTableModel, QModelIndex, QSortFilterProxyModel, Qt, pyqtSignal
 from PyQt5.QtGui import QColor, QKeySequence, QTextDocument
@@ -37,12 +37,13 @@ TYPE_COLORS = {
 
 # Maps table column index → DiffFilterProxy field key (used by HighlightDelegate)
 _COL_FIELD: dict[int, str] = {
-    1: "project",
-    2: "table",
-    3: "key",
-    4: "field",
-    5: "old_value",
-    6: "new_value",
+    1: "snapshot",
+    2: "project",
+    3: "table",
+    4: "key",
+    5: "field",
+    6: "old_value",
+    7: "new_value",
 }
 
 
@@ -103,6 +104,7 @@ class HighlightDelegate(QStyledItemDelegate):
         self.initStyleOption(opt, index)
         opt.text = ""
         style = QApplication.style()
+        assert style is not None
         style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter)
 
         # Render highlighted HTML into the text rect
@@ -119,7 +121,7 @@ class HighlightDelegate(QStyledItemDelegate):
 class DiffTableModel(QAbstractTableModel):
     """Table model for diff results. Backed by a flat list of RecordDiff."""
 
-    COLUMNS = ["Type", "Project", "Table", "Key", "Changed Fields", "Old Value", "New Value"]
+    COLUMNS = ["Type", "Snapshot", "Project", "Table", "Key", "Changed Fields", "Old Value", "New Value"]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -165,24 +167,26 @@ class DiffTableModel(QAbstractTableModel):
             if col == 0:
                 return diff.change_type.value.upper()
             elif col == 1:
-                return diff.project_name
+                return diff.snapshot_label
             elif col == 2:
-                return diff.table_type.display_name
+                return diff.project_name
             elif col == 3:
-                return diff.record_key
+                return diff.table_type.display_name
             elif col == 4:
-                return ", ".join(diff.changed_fields) if diff.changed_fields else "--"
+                return diff.record_key
             elif col == 5:
-                return _summarize_old(diff)
+                return ", ".join(diff.changed_fields) if diff.changed_fields else "--"
             elif col == 6:
+                return _summarize_old(diff)
+            elif col == 7:
                 return _summarize_new(diff)
 
         elif role == Qt.ItemDataRole.ForegroundRole:
             if col == 0:
                 return TYPE_COLORS.get(diff.change_type)
-            elif col == 5 and diff.change_type == ChangeType.DELETED:
+            elif col == 6 and diff.change_type == ChangeType.DELETED:
                 return QColor(220, 80, 80)
-            elif col == 6 and diff.change_type == ChangeType.ADDED:
+            elif col == 7 and diff.change_type == ChangeType.ADDED:
                 return QColor(80, 200, 80)
 
         elif role == Qt.ItemDataRole.UserRole:
@@ -257,12 +261,13 @@ class FilterHeaderView(QHeaderView):
 
     # col_index -> (field_key, base_label)
     _COL_FIELDS: dict[int, tuple[str, str]] = {
-        1: ("project",   "Project"),
-        2: ("table",     "Table"),
-        3: ("key",       "Key"),
-        4: ("field",     "Field"),
-        5: ("old_value", "Old value"),
-        6: ("new_value", "New value"),
+        1: ("snapshot",  "Snapshot"),
+        2: ("project",   "Project"),
+        3: ("table",     "Table"),
+        4: ("key",       "Key"),
+        5: ("field",     "Field"),
+        6: ("old_value", "Old value"),
+        7: ("new_value", "New value"),
     }
 
     def __init__(self, parent=None):
@@ -427,7 +432,7 @@ class DiffFilterProxy(QSortFilterProxyModel):
         if model is None:
             return True
 
-        diff = model.get_diff(source_row)
+        diff = cast(DiffTableModel, model).get_diff(source_row)
         if diff is None:
             return True
 
@@ -450,6 +455,7 @@ class DiffFilterProxy(QSortFilterProxyModel):
             "field":     diff.changed_fields,
             "old_value": list((diff.old_fields or {}).values()),
             "new_value": list((diff.new_fields or {}).values()),
+            "snapshot":  [diff.snapshot_label],
         }
 
         for field, pattern in self._field_patterns.items():
@@ -503,8 +509,9 @@ class DiffViewer(QWidget):
         self.filter_header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         self.filter_header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
         self.filter_header.setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        self.filter_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.filter_header.setSectionResizeMode(5, QHeaderView.ResizeMode.Interactive)
         self.filter_header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
+        self.filter_header.setSectionResizeMode(7, QHeaderView.ResizeMode.Stretch)
 
         # Set up column sorting manually — setSortingEnabled() uses private Qt slots
         # that don't reliably wire up when the header is replaced after construction.
@@ -538,7 +545,10 @@ class DiffViewer(QWidget):
 
     def get_selected_diff(self) -> Optional[RecordDiff]:
         """Get the RecordDiff for the currently selected row."""
-        indexes = self.table.selectionModel().selectedRows()
+        sel = self.table.selectionModel()
+        if sel is None:
+            return None
+        indexes = sel.selectedRows()
         if not indexes:
             return None
         source_index = self.proxy.mapToSource(indexes[0])
@@ -546,7 +556,10 @@ class DiffViewer(QWidget):
 
     def get_selected_diffs(self) -> list[RecordDiff]:
         """Get RecordDiff objects for all selected rows."""
-        indexes = self.table.selectionModel().selectedRows()
+        sel = self.table.selectionModel()
+        if sel is None:
+            return []
+        indexes = sel.selectedRows()
         diffs = []
         for idx in indexes:
             source_index = self.proxy.mapToSource(idx)
@@ -571,7 +584,9 @@ class DiffViewer(QWidget):
         )
         menu.addAction(recover_action)
 
-        menu.exec_(self.table.viewport().mapToGlobal(position))
+        vp = self.table.viewport()
+        if vp is not None:
+            menu.exec_(vp.mapToGlobal(position))
 
     def _apply_filter(self) -> None:
         self.proxy.set_filter(

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAction,
     QHBoxLayout,
@@ -67,9 +67,9 @@ class ProjectTree(QWidget):
         self.tree.setHeaderHidden(True)
         self.tree.setRootIsDecorated(True)
         self.tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
-        self.tree.selectionModel().selectionChanged.connect(
-            self._on_selection_changed
-        )
+        tree_sel = self.tree.selectionModel()
+        assert tree_sel is not None
+        tree_sel.selectionChanged.connect(self._on_selection_changed)
         self.tree.itemChanged.connect(self._on_item_changed)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._show_context_menu)
@@ -148,6 +148,7 @@ class ProjectTree(QWidget):
 
     def _populate_tree(self) -> None:
         """Populate as hierarchical tree view."""
+        assert self._all_item is not None
         self.tree.setRootIsDecorated(True)
 
         included_by_others: set[str] = set()
@@ -166,6 +167,7 @@ class ProjectTree(QWidget):
 
     def _populate_flat(self) -> None:
         """Populate as flat alphabetical list."""
+        assert self._all_item is not None
         self.tree.setRootIsDecorated(False)
 
         for project in sorted(self._projects.values(), key=lambda p: p.name):
@@ -283,7 +285,9 @@ class ProjectTree(QWidget):
                 )
                 unhide_all.triggered.connect(self._unhide_all)
                 menu.addAction(unhide_all)
-                menu.exec_(self.tree.viewport().mapToGlobal(position))
+                tree_vp = self.tree.viewport()
+                if tree_vp is not None:
+                    menu.exec_(tree_vp.mapToGlobal(position))
             return
 
         # Determine which are hidden and which are visible
@@ -322,7 +326,9 @@ class ProjectTree(QWidget):
             unhide_all.triggered.connect(self._unhide_all)
             menu.addAction(unhide_all)
 
-        menu.exec_(self.tree.viewport().mapToGlobal(position))
+        tree_vp = self.tree.viewport()
+        if tree_vp is not None:
+            menu.exec_(tree_vp.mapToGlobal(position))
 
     def _hide_projects(self, names: set[str]) -> None:
         """Hide one or more projects from the tree."""
@@ -376,6 +382,8 @@ class ProjectTree(QWidget):
         """Recursively apply hidden/visible state to tree items."""
         for i in range(parent.childCount()):
             item = parent.child(i)
+            if item is None:
+                continue
             project_name = item.data(0, ROLE_PROJECT_NAME)
 
             if project_name and project_name in self._hidden:
@@ -479,6 +487,8 @@ class ProjectTree(QWidget):
         state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
         for i in range(parent.childCount()):
             child = parent.child(i)
+            if child is None:
+                continue
             child.setCheckState(0, state)
             self._set_all_children_checked(child, checked)
 
@@ -488,6 +498,8 @@ class ProjectTree(QWidget):
         """Recursively update exclusions for all children."""
         for i in range(parent.childCount()):
             child = parent.child(i)
+            if child is None:
+                continue
             project_name = child.data(0, ROLE_PROJECT_NAME)
             if project_name:
                 if checked:
@@ -506,7 +518,10 @@ class ProjectTree(QWidget):
         checked_count = 0
         partial_count = 0
         for i in range(parent.childCount()):
-            state = parent.child(i).checkState(0)
+            ch = parent.child(i)
+            if ch is None:
+                continue
+            state = ch.checkState(0)
             if state == Qt.CheckState.Checked:
                 checked_count += 1
             elif state == Qt.CheckState.PartiallyChecked:
@@ -565,6 +580,8 @@ class ProjectTree(QWidget):
         """Recursively restore check states from exclusion set."""
         for i in range(parent.childCount()):
             item = parent.child(i)
+            if item is None:
+                continue
             project_name = item.data(0, ROLE_PROJECT_NAME)
             if project_name:
                 if project_name in self._excluded:
@@ -584,7 +601,10 @@ class ProjectTree(QWidget):
             return
         checked_count = 0
         for i in range(parent.childCount()):
-            state = parent.child(i).checkState(0)
+            ch = parent.child(i)
+            if ch is None:
+                continue
+            state = ch.checkState(0)
             if state == Qt.CheckState.Checked:
                 checked_count += 1
             elif state == Qt.CheckState.PartiallyChecked:
@@ -641,6 +661,8 @@ class ProjectTree(QWidget):
         names: set[str] = set()
         for i in range(item.childCount()):
             child = item.child(i)
+            if child is None:
+                continue
             name = child.data(0, ROLE_PROJECT_NAME)
             if name:
                 names.add(name)
@@ -651,6 +673,8 @@ class ProjectTree(QWidget):
         """Recursively update item labels with own + included change counts."""
         for i in range(parent.childCount()):
             item = parent.child(i)
+            if item is None:
+                continue
             project_name = item.data(0, ROLE_PROJECT_NAME)
             original_label = item.data(0, ROLE_ORIGINAL_LABEL)
 

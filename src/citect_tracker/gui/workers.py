@@ -9,7 +9,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from ..core.dbf_writer import RecoverError, recover_record
 from ..core.diff_engine import DiffEngine
-from ..core.models import DiffSummary, RecordDiff, SnapshotMeta, TableType
+from ..core.models import RecordDiff, SnapshotMeta, TableType
 from ..core.snapshot_engine import SnapshotEngine
 from ..storage.database import Database
 
@@ -80,6 +80,7 @@ class DiffWorker(QThread):
         project_filter: Optional[set[str]] = None,
         table_filter: Optional[TableType] = None,
         excluded_projects: Optional[set[str]] = None,
+        intermediate_snapshots: Optional[list[SnapshotMeta]] = None,
         parent=None,
     ):
         super().__init__(parent)
@@ -89,6 +90,7 @@ class DiffWorker(QThread):
         self.project_filter = project_filter
         self.table_filter = table_filter
         self.excluded_projects = excluded_projects
+        self.intermediate_snapshots = intermediate_snapshots
 
     def run(self) -> None:
         try:
@@ -102,6 +104,7 @@ class DiffWorker(QThread):
                     project_filter=self.project_filter,
                     table_filter=self.table_filter,
                     excluded_projects=self.excluded_projects,
+                    intermediate_snapshots=self.intermediate_snapshots,
                 )
                 self.finished.emit(summary)
             finally:

@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Generator, Optional
 
 from ..core.models import (
-    ChangeType,
     ProjectInfo,
     SnapshotMeta,
     TableRecord,

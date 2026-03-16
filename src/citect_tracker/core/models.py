@@ -92,6 +92,7 @@ class RecordDiff:
     old_fields: Optional[dict[str, str]]
     new_fields: Optional[dict[str, str]]
     changed_fields: list[str] = field(default_factory=list)
+    snapshot_label: str = ""  # Snapshot where this change first appeared
 
 
 @dataclass

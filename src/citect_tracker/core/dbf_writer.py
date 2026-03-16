@@ -9,7 +9,7 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from .models import ChangeType, RecordDiff, TableType
+from .models import ChangeType, RecordDiff
 
 
 class RecoverError(Exception):
@@ -73,7 +73,7 @@ def recover_record(
     with open(dbf_path, "rb") as f:
         file_data = bytearray(f.read())
 
-    nrecs, hlen, rlen, fields_def = _parse_header(file_data)
+    nrecs, hlen, rlen, fields_def = _parse_header(bytes(file_data))
     field_offsets = _find_field_offsets(fields_def)
     key_field = diff.table_type.key_field
 

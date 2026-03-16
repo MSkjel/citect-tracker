@@ -128,11 +128,18 @@ class SnapshotPanel(QWidget):
         if self.get_selected_snapshot_id() is None:
             return
         menu = QMenu(self)
-        menu.addAction(QAction("Edit label", self, triggered=lambda: self._on_rename(
-            self.snapshot_list.currentItem()
-        )))
-        menu.addAction(QAction("Edit notes", self, triggered=self._on_edit_notes))
+        edit_label = QAction("Edit label", self)
+        edit_label.triggered.connect(lambda: self._on_rename_current())
+        menu.addAction(edit_label)
+        edit_notes = QAction("Edit notes", self)
+        edit_notes.triggered.connect(self._on_edit_notes)
+        menu.addAction(edit_notes)
         menu.exec_(self.snapshot_list.mapToGlobal(pos))
+
+    def _on_rename_current(self) -> None:
+        item = self.snapshot_list.currentItem()
+        if item is not None:
+            self._on_rename(item)
 
     def _on_delete(self) -> None:
         sid = self.get_selected_snapshot_id()
@@ -142,7 +149,7 @@ class SnapshotPanel(QWidget):
             self,
             "Delete Snapshot",
             "Delete the selected snapshot? This cannot be undone.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,  # type: ignore[arg-type]
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.delete_requested.emit(sid)
