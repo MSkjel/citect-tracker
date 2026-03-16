@@ -720,7 +720,7 @@ class ProjectTree(QWidget):
                 if not has_folder:
                     item.setForeground(0, QColor(150, 150, 150))
                 else:
-                    item.setForeground(0, QColor(0, 0, 0))
+                    item.setData(0, Qt.ItemDataRole.ForegroundRole, None)
 
     def clear_change_indicators(self) -> None:
         """Remove all change indicators."""

@@ -35,8 +35,23 @@ class DiffEngine:
         old_meta = self.db.get_snapshot_meta(old_id)
         new_meta = self.db.get_snapshot_meta(new_id)
 
+        # Restrict to projects present in both snapshots to avoid noise from
+        # partial snapshots (e.g. a ctback32 auto-snapshot of one project
+        # compared against a full snapshot would otherwise show every record
+        # in the other projects as "Added").
+        old_projects = {p["name"] for p in self.db.get_snapshot_projects(old_id)}
+        new_projects = {p["name"] for p in self.db.get_snapshot_projects(new_id)}
+        if old_projects and new_projects:
+            intersection = old_projects & new_projects
+            if project_filter:
+                effective_filter: Optional[set[str]] = project_filter & intersection
+            else:
+                effective_filter = intersection
+        else:
+            effective_filter = project_filter
+
         raw_changes = self.db.find_changes(
-            old_id, new_id, project_filter, table_filter
+            old_id, new_id, effective_filter, table_filter
         )
 
         # Filter out excluded projects
@@ -122,7 +137,7 @@ class DiffEngine:
                 pair_new_id = intermediate_snapshots[i + 1].snapshot_id
                 pair_label = _fmt(intermediate_snapshots[i + 1])
                 pair_changes = self.db.find_changes(
-                    pair_old_id, pair_new_id, project_filter, table_filter
+                    pair_old_id, pair_new_id, effective_filter, table_filter
                 )
                 for c in pair_changes:
                     if excluded_projects and c["project_name"] in excluded_projects:

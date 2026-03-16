@@ -172,13 +172,15 @@ class SnapshotCompareBar(QWidget):
         layout.addWidget(QLabel("Compare:"))
 
         self.combo_old = QComboBox()
-        self.combo_old.setMinimumWidth(200)
+        self.combo_old.setMinimumWidth(350)
+        self.combo_old.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         layout.addWidget(self.combo_old)
 
         layout.addWidget(QLabel("<->"))
 
         self.combo_new = QComboBox()
-        self.combo_new.setMinimumWidth(200)
+        self.combo_new.setMinimumWidth(350)
+        self.combo_new.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         layout.addWidget(self.combo_new)
 
         self.compare_btn = QPushButton("Compare")

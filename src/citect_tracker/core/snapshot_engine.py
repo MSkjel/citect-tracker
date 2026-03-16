@@ -39,6 +39,7 @@ class SnapshotEngine:
         label: str = "",
         progress_callback: ProgressCallback = None,
         excluded_projects: set[str] | None = None,
+        include_projects: set[str] | None = None,
         taken_by: str = "",
     ) -> SnapshotMeta:
         """Take a complete snapshot of all projects and their data tables.
@@ -56,6 +57,12 @@ class SnapshotEngine:
         if excluded_projects:
             projects_with_data = [
                 p for p in projects_with_data if p.name not in excluded_projects
+            ]
+
+        # Include only specified projects (partial snapshot)
+        if include_projects:
+            projects_with_data = [
+                p for p in projects_with_data if p.name in include_projects
             ]
 
         if not label:
@@ -79,13 +86,15 @@ class SnapshotEngine:
                 timestamp=datetime.now(),
                 label=label,
                 source_dir=str(source_dir),
-                project_count=len(projects),
+                project_count=len(projects_with_data),
                 taken_by=taken_by,
             )
 
-            # Store project metadata
+            # Store project metadata (only for included projects)
+            included_names = {p.name for p in projects_with_data}
             for project in projects.values():
-                self.db.store_project_info(snapshot_id, project)
+                if project.name in included_names:
+                    self.db.store_project_info(snapshot_id, project)
 
             # Read files in parallel, write to DB as results complete
             with ThreadPoolExecutor(max_workers=max_workers) as executor:

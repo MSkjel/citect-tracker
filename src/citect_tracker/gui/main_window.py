@@ -26,9 +26,11 @@ from ..core.project_discovery import discover_projects
 from ..core.snapshot_engine import SnapshotEngine
 from ..storage.database import Database
 from .diff_viewer import DiffViewer
+from .options_dialog import OptionsDialog, apply_theme
 from .project_tree import ProjectTree
 from .record_detail import RecordDetailDialog, RecordDetailPanel
 from .snapshot_panel import SnapshotCompareBar, SnapshotPanel
+from .watchers import ProcessWatcher
 from .workers import DiffWorker, RecoverWorker, SnapshotWorker
 
 
@@ -47,15 +49,23 @@ class MainWindow(QMainWindow):
         self._project_filter: Optional[set[str]] = None
         self._snapshots: list[SnapshotMeta] = []
 
+        self._proc_watcher = ProcessWatcher(self)
+        self._proc_watcher.backup_detected.connect(self._on_ctback_backup)
+        # self._proc_watcher.restore_detected.connect(self._on_ctback_restore)
+
+        apply_theme(QSettings().value("options/theme", "System", type=str).lower())
+
         self.setMinimumSize(1200, 700)
         self._setup_ui()
         self._setup_menu()
         self._load_initial_data()
         self._update_window_title()
+        if QSettings().value("options/auto_snapshot", True, type=bool):
+            self._proc_watcher.start()
 
     def _update_window_title(self) -> None:
         db_name = self.db.db_path.name
-        self.setWindowTitle(f"Citect Tracker — {db_name}  [{self._user_name}]")
+        self.setWindowTitle(f"Citect Tracker. {db_name}  [{self._user_name}]")
 
     def _setup_ui(self) -> None:
         central = QWidget()
@@ -179,6 +189,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Change &User Name...", self._change_user_name)
         file_menu.addSeparator()
+        file_menu.addAction("&Options...", self._open_options)
+        file_menu.addSeparator()
         file_menu.addAction("&Quit", self.close)
 
         help_menu = menu_bar.addMenu("&Help")
@@ -199,7 +211,7 @@ class MainWindow(QMainWindow):
             f"{len(snapshots)} snapshot(s) available"
         )
 
-        if len(snapshots) >= 2:
+        if len(snapshots) >= 2 and QSettings().value("options/auto_compare", True, type=bool):
             QTimer.singleShot(0, lambda: self._compare_snapshots(
                 snapshots[1].snapshot_id, snapshots[0].snapshot_id
             ))
@@ -601,6 +613,56 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.diff_viewer.export_to_csv(path)
+
+    def _on_ctback_backup(self, project_name: str) -> None:
+        """ctback32.exe /b detected- Take a partial snapshot of the project."""
+        if not self.source_dir:
+            return
+        label = f"Auto{f' ({project_name})' if project_name else ''}"
+        include = {project_name} if project_name else None
+        self.status_bar.showMessage(
+            f"ctback32 backup detected{f' for {project_name}' if project_name else ''}. Taking snapshot..."
+        )
+        excluded = self.project_tree.get_excluded_projects()
+        worker = SnapshotWorker(
+            self.db.db_path,
+            self.source_dir,
+            label=label,
+            excluded_projects=excluded or None,
+            include_projects=include,
+            taken_by=self._user_name,
+            parent=self,
+        )
+
+        def on_finished(meta: SnapshotMeta) -> None:
+            self._active_worker = None
+            self._refresh_snapshots()
+            self.status_bar.showMessage(
+                f"Auto-snapshot taken: {meta.label} ({meta.total_records:,} records)"
+            )
+
+        def on_error(msg: str) -> None:
+            self._active_worker = None
+            self.status_bar.showMessage(f"Auto-snapshot failed: {msg}")
+
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        self._active_worker = worker
+        worker.start()
+
+    # def _on_ctback_restore(self, project_name: str) -> None:
+    #     """ctback32.exe /r detected. Notify the user."""
+    #     self.status_bar.showMessage(
+    #         f"ctback32 restore detected{f' for {project_name}' if project_name else ''}"
+    #     )
+
+    def _open_options(self) -> None:
+        dlg = OptionsDialog(self)
+        if dlg.exec():
+            if QSettings().value("options/auto_snapshot", True, type=bool):
+                self._proc_watcher.start()
+            else:
+                self._proc_watcher.stop()
 
     def _show_about(self) -> None:
         QMessageBox.about(

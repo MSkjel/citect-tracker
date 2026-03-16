@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Generator, Optional
 
+import xxhash
+
 from ..core.models import (
     ProjectInfo,
     SnapshotMeta,
@@ -16,7 +18,7 @@ from ..core.models import (
     TableType,
 )
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -34,13 +36,22 @@ CREATE TABLE IF NOT EXISTS snapshots (
     taken_by        TEXT DEFAULT ''
 );
 
-CREATE TABLE IF NOT EXISTS snapshot_projects (
-    snapshot_id     INTEGER NOT NULL REFERENCES snapshots(id) ON DELETE CASCADE,
-    project_name    TEXT NOT NULL,
-    title           TEXT DEFAULT '',
-    includes_json   TEXT DEFAULT '[]',
-    PRIMARY KEY (snapshot_id, project_name)
+CREATE TABLE IF NOT EXISTS project_data (
+    hash            BLOB PRIMARY KEY,
+    title           TEXT NOT NULL DEFAULT '',
+    includes_json   TEXT NOT NULL DEFAULT '[]'
 );
+
+CREATE TABLE IF NOT EXISTS snapshot_projects (
+    project_name        TEXT NOT NULL,
+    data_hash           BLOB NOT NULL REFERENCES project_data(hash),
+    first_snapshot_id   INTEGER NOT NULL,
+    last_snapshot_id    INTEGER NOT NULL,
+    PRIMARY KEY (project_name, first_snapshot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_sp_active
+    ON snapshot_projects(project_name, last_snapshot_id, first_snapshot_id);
 
 CREATE TABLE IF NOT EXISTS record_data (
     hash            BLOB PRIMARY KEY,
@@ -104,7 +115,6 @@ class Database:
 
     def _init_schema(self) -> None:
         self.conn.executescript(SCHEMA_SQL)
-        # Check/set schema version
         cur = self.conn.execute(
             "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
         )
@@ -113,15 +123,12 @@ class Database:
             self.conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
             )
-        else:
-            current_version = row["version"]
-            if current_version < 4:
-                self.conn.execute(
-                    "ALTER TABLE snapshots ADD COLUMN taken_by TEXT DEFAULT ''"
-                )
-                self.conn.execute(
-                    "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
-                )
+        elif row["version"] != SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {row['version']} is incompatible with "
+                f"the required version {SCHEMA_VERSION}. "
+                "Please create a new database."
+            )
         self.conn.commit()
 
     # -- Snapshot CRUD --
@@ -242,7 +249,39 @@ class Database:
                 (snapshot_id,),
             )
 
-        # Delete snapshot row (cascades to snapshot_projects)
+        # Adjust project version ranges for this snapshot
+        # Single-snapshot project versions — delete entirely
+        self.conn.execute(
+            "DELETE FROM snapshot_projects "
+            "WHERE first_snapshot_id = ? AND last_snapshot_id = ?",
+            (snapshot_id, snapshot_id),
+        )
+        # Versions starting at this snapshot
+        if next_id is not None:
+            self.conn.execute(
+                "UPDATE snapshot_projects SET first_snapshot_id = ? "
+                "WHERE first_snapshot_id = ?",
+                (next_id, snapshot_id),
+            )
+        else:
+            self.conn.execute(
+                "DELETE FROM snapshot_projects WHERE first_snapshot_id = ?",
+                (snapshot_id,),
+            )
+        # Versions ending at this snapshot
+        if prev_id is not None:
+            self.conn.execute(
+                "UPDATE snapshot_projects SET last_snapshot_id = ? "
+                "WHERE last_snapshot_id = ?",
+                (prev_id, snapshot_id),
+            )
+        else:
+            self.conn.execute(
+                "DELETE FROM snapshot_projects WHERE last_snapshot_id = ?",
+                (snapshot_id,),
+            )
+
+        # Delete snapshot row
         self.conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
         self.conn.commit()
 
@@ -253,21 +292,54 @@ class Database:
     # -- Project info --
 
     def store_project_info(self, snapshot_id: int, project: ProjectInfo) -> None:
+        """Store project info with content-addressable dedup and version ranges."""
+        includes_json = json.dumps(project.includes)
+        h = xxhash.xxh3_128_digest(
+            f"{project.title}\x00{includes_json}".encode()
+        )
+
+        # Find previous snapshot
+        prev_row = self.conn.execute(
+            "SELECT id FROM snapshots WHERE id < ? ORDER BY id DESC LIMIT 1",
+            (snapshot_id,),
+        ).fetchone()
+        prev_snapshot_id = prev_row["id"] if prev_row else None
+
+        if prev_snapshot_id is not None:
+            prev_ver = self.conn.execute(
+                "SELECT data_hash, first_snapshot_id FROM snapshot_projects "
+                "WHERE project_name = ? AND last_snapshot_id = ?",
+                (project.name, prev_snapshot_id),
+            ).fetchone()
+            if prev_ver is not None and bytes(prev_ver["data_hash"]) == h:
+                # Same data — extend range
+                self.conn.execute(
+                    "UPDATE snapshot_projects SET last_snapshot_id = ? "
+                    "WHERE project_name = ? AND first_snapshot_id = ?",
+                    (snapshot_id, project.name, prev_ver["first_snapshot_id"]),
+                )
+                return
+
+        # New or changed — insert data + new version row
         self.conn.execute(
-            "INSERT INTO snapshot_projects (snapshot_id, project_name, title, includes_json) "
+            "INSERT OR IGNORE INTO project_data (hash, title, includes_json) VALUES (?, ?, ?)",
+            (h, project.title, includes_json),
+        )
+        self.conn.execute(
+            "INSERT INTO snapshot_projects "
+            "(project_name, data_hash, first_snapshot_id, last_snapshot_id) "
             "VALUES (?, ?, ?, ?)",
-            (
-                snapshot_id,
-                project.name,
-                project.title,
-                json.dumps(project.includes),
-            ),
+            (project.name, h, snapshot_id, snapshot_id),
         )
 
     def get_snapshot_projects(self, snapshot_id: int) -> list[dict]:
         """Get project info for a snapshot."""
         cur = self.conn.execute(
-            "SELECT * FROM snapshot_projects WHERE snapshot_id = ?", (snapshot_id,)
+            "SELECT sp.project_name, pd.title, pd.includes_json "
+            "FROM snapshot_projects sp "
+            "JOIN project_data pd ON sp.data_hash = pd.hash "
+            "WHERE sp.first_snapshot_id <= ? AND sp.last_snapshot_id >= ?",
+            (snapshot_id, snapshot_id),
         )
         return [
             {
@@ -482,9 +554,13 @@ class Database:
         ]
 
     def cleanup_orphaned_records(self) -> None:
-        """Remove record_data entries not referenced by any version."""
+        """Remove record_data and project_data entries not referenced by any version."""
         self.conn.execute(
             "DELETE FROM record_data WHERE hash NOT IN "
             "(SELECT DISTINCT record_hash FROM record_versions)"
+        )
+        self.conn.execute(
+            "DELETE FROM project_data WHERE hash NOT IN "
+            "(SELECT DISTINCT data_hash FROM snapshot_projects)"
         )
         self.conn.commit()
