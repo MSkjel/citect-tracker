@@ -539,6 +539,8 @@ class DiffViewer(QWidget):
         all_diffs = summary.all_changes()
         self.model.set_diffs(all_diffs)
         self._apply_filter()
+        for col in (0, 2, 3, 4, 5):  # Type, Project, Table, Key, Changed Fields
+            self.table.resizeColumnToContents(col)
 
     def clear(self) -> None:
         self.model.clear()
