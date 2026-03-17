@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-from PyQt5.QtCore import QByteArray, QSettings, Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -26,6 +26,7 @@ from ..core.project_discovery import discover_projects
 from ..core.snapshot_engine import SnapshotEngine
 from ..storage.database import Database
 from .diff_viewer import DiffViewer
+from .app_settings import settings
 from .options_dialog import OptionsDialog, apply_theme
 from .project_tree import ProjectTree
 from .record_detail import RecordDetailDialog, RecordDetailPanel
@@ -51,16 +52,18 @@ class MainWindow(QMainWindow):
 
         self._proc_watcher = ProcessWatcher(self)
         self._proc_watcher.backup_detected.connect(self._on_ctback_backup)
-        # self._proc_watcher.restore_detected.connect(self._on_ctback_restore)
+        self._proc_watcher.restore_completed.connect(self._on_ctback_restore)
+        if source_dir:
+            self._proc_watcher.source_dir = str(source_dir)
 
-        apply_theme(QSettings().value("options/theme", "System", type=str).lower())
+        apply_theme(settings.theme.lower())
 
         self.setMinimumSize(1200, 700)
         self._setup_ui()
         self._setup_menu()
         self._load_initial_data()
         self._update_window_title()
-        if QSettings().value("options/auto_snapshot", True, type=bool):
+        if settings.auto_backup or settings.auto_restore:
             self._proc_watcher.start()
 
     def _update_window_title(self) -> None:
@@ -151,27 +154,23 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self.status_bar)
 
         # Restore geometry and splitter positions
-        s = QSettings()
-        geom = s.value("window/geometry")
-        if geom is not None:
-            self.restoreGeometry(geom if isinstance(geom, QByteArray) else QByteArray(geom))
-        for key, widget in [
-            ("splitter/main", self.main_splitter),
-            ("splitter/left", self.left_splitter),
-            ("splitter/right", self.right_splitter),
-            ("header/diff_table", self.diff_viewer.filter_header),
+        if (geom := settings.window_geometry) is not None:
+            self.restoreGeometry(geom)
+        for state, widget in [
+            (settings.splitter_main, self.main_splitter),
+            (settings.splitter_left, self.left_splitter),
+            (settings.splitter_right, self.right_splitter),
+            (settings.header_diff_table, self.diff_viewer.filter_header),
         ]:
-            val = s.value(key)
-            if val is not None:
-                widget.restoreState(val if isinstance(val, QByteArray) else QByteArray(val))
+            if state is not None:
+                widget.restoreState(state)
 
     def closeEvent(self, a0) -> None:  # type: ignore[override]
-        s = QSettings()
-        s.setValue("window/geometry", self.saveGeometry())
-        s.setValue("splitter/main", self.main_splitter.saveState())
-        s.setValue("splitter/left", self.left_splitter.saveState())
-        s.setValue("splitter/right", self.right_splitter.saveState())
-        s.setValue("header/diff_table", self.diff_viewer.filter_header.saveState())
+        settings.window_geometry = self.saveGeometry()
+        settings.splitter_main = self.main_splitter.saveState()
+        settings.splitter_left = self.left_splitter.saveState()
+        settings.splitter_right = self.right_splitter.saveState()
+        settings.header_diff_table = self.diff_viewer.filter_header.saveState()
         super().closeEvent(a0)
 
     def _setup_menu(self) -> None:
@@ -211,7 +210,7 @@ class MainWindow(QMainWindow):
             f"{len(snapshots)} snapshot(s) available"
         )
 
-        if len(snapshots) >= 2 and QSettings().value("options/auto_compare", True, type=bool):
+        if len(snapshots) >= 2 and settings.auto_compare:
             QTimer.singleShot(0, lambda: self._compare_snapshots(
                 snapshots[1].snapshot_id, snapshots[0].snapshot_id
             ))
@@ -222,16 +221,11 @@ class MainWindow(QMainWindow):
             return
         try:
             # Restore exclusions and hidden from settings before loading
-            excluded = QSettings().value("excluded_projects", [])
-            if excluded:
+            if excluded := settings.excluded_projects:
                 self.project_tree.set_excluded_projects(set(excluded))
-
-            hidden = QSettings().value("hidden_projects", [])
-            if hidden:
+            if hidden := settings.hidden_projects:
                 self.project_tree.set_hidden_projects(set(hidden))
-
-            flat_mode = QSettings().value("project_flat_mode", False, type=bool)
-            if flat_mode:
+            if settings.project_flat_mode:
                 self.project_tree.set_flat_mode(True)
 
             projects = discover_projects(self.source_dir)
@@ -256,7 +250,8 @@ class MainWindow(QMainWindow):
                 )
                 return
             self.source_dir = path
-            QSettings().setValue("last_dbf_directory", str(path))
+            self._proc_watcher.source_dir = str(path)
+            settings.last_dbf_directory = str(path)
             self._load_project_tree()
             self.status_bar.showMessage(f"Loaded: {dir_path}")
 
@@ -279,7 +274,7 @@ class MainWindow(QMainWindow):
         self.db.connect()
         self.snapshot_engine = SnapshotEngine(self.db)
         self.diff_engine = DiffEngine(self.db)
-        QSettings().setValue("db_path", str(db_path))
+        settings.db_path = str(db_path)
         self._update_window_title()
         self._current_diff = None
         self.diff_viewer.clear()
@@ -296,7 +291,7 @@ class MainWindow(QMainWindow):
         )
         if ok and new_name.strip():
             self._user_name = new_name.strip()
-            QSettings().setValue("user_name", self._user_name)
+            settings.user_name = self._user_name
             self._update_window_title()
             self.status_bar.showMessage(f"User name set to: {self._user_name}")
 
@@ -488,15 +483,15 @@ class MainWindow(QMainWindow):
 
     def _on_exclusions_changed(self, excluded: set[str]) -> None:
         """Save exclusion settings when checkboxes change."""
-        QSettings().setValue("excluded_projects", list(excluded))
+        settings.excluded_projects = list(excluded)
 
     def _on_hidden_changed(self, hidden: set[str]) -> None:
         """Save hidden projects when they change."""
-        QSettings().setValue("hidden_projects", list(hidden))
+        settings.hidden_projects = list(hidden)
 
     def _on_view_mode_changed(self, flat: bool) -> None:
         """Save view mode when it changes."""
-        QSettings().setValue("project_flat_mode", flat)
+        settings.project_flat_mode = flat
 
     def _on_diff_selection_changed(self) -> None:
         """Update record detail panel when selection changes."""
@@ -615,10 +610,12 @@ class MainWindow(QMainWindow):
             self.diff_viewer.export_to_csv(path)
 
     def _on_ctback_backup(self, project_name: str) -> None:
-        """ctback32.exe /b detected- Take a partial snapshot of the project."""
+        """ctback32.exe /b detected. Take a partial snapshot of the project."""
         if not self.source_dir:
             return
-        label = f"Auto{f' ({project_name})' if project_name else ''}"
+        if not settings.auto_backup:
+            return
+        label = f"Auto(backup){f' ({project_name})' if project_name else ''}"
         include = {project_name} if project_name else None
         self.status_bar.showMessage(
             f"ctback32 backup detected{f' for {project_name}' if project_name else ''}. Taking snapshot..."
@@ -650,16 +647,48 @@ class MainWindow(QMainWindow):
         self._active_worker = worker
         worker.start()
 
-    # def _on_ctback_restore(self, project_name: str) -> None:
-    #     """ctback32.exe /r detected. Notify the user."""
-    #     self.status_bar.showMessage(
-    #         f"ctback32 restore detected{f' for {project_name}' if project_name else ''}"
-    #     )
+    def _on_ctback_restore(self, project_name: str) -> None:
+        """ctback32.exe /r completed. Take a snapshot to record the restored state."""
+        if not self.source_dir:
+            return
+        if not settings.auto_restore:
+            return
+        label = f"Auto(restore){f' ({project_name})' if project_name else ''}"
+        include = {project_name} if project_name else None
+        self.status_bar.showMessage(
+            f"ctback32 restore complete{f' for {project_name}' if project_name else ''}. Taking snapshot..."
+        )
+        excluded = self.project_tree.get_excluded_projects()
+        worker = SnapshotWorker(
+            self.db.db_path,
+            self.source_dir,
+            label=label,
+            excluded_projects=excluded or None,
+            include_projects=include,
+            taken_by=self._user_name,
+            parent=self,
+        )
+
+        def on_finished(meta: SnapshotMeta) -> None:
+            self._active_worker = None
+            self._refresh_snapshots()
+            self.status_bar.showMessage(
+                f"Auto-snapshot taken: {meta.label} ({meta.total_records:,} records)"
+            )
+
+        def on_error(msg: str) -> None:
+            self._active_worker = None
+            self.status_bar.showMessage(f"Auto-snapshot failed: {msg}")
+
+        worker.finished.connect(on_finished)
+        worker.error.connect(on_error)
+        self._active_worker = worker
+        worker.start()
 
     def _open_options(self) -> None:
         dlg = OptionsDialog(self)
         if dlg.exec():
-            if QSettings().value("options/auto_snapshot", True, type=bool):
+            if settings.auto_backup or settings.auto_restore:
                 self._proc_watcher.start()
             else:
                 self._proc_watcher.stop()

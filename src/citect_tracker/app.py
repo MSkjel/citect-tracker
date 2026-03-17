@@ -6,7 +6,6 @@ import getpass
 import sys
 from pathlib import Path
 
-from PyQt5.QtCore import QSettings
 from PyQt5.QtWidgets import QApplication, QFileDialog, QMessageBox
 
 from .gui.main_window import MainWindow
@@ -19,7 +18,8 @@ def main() -> None:
     app.setApplicationName("Citect Tracker")
     app.setOrganizationName("CitectTracker")
 
-    settings = QSettings()
+    # Import after QApplication is created so QSettings works
+    from .gui.app_settings import settings
 
     # Determine source directory from command line or saved setting
     source_dir = None
@@ -30,16 +30,14 @@ def main() -> None:
         elif candidate.name == "MASTER.DBF" and candidate.exists():
             source_dir = candidate.parent
 
-    # Try saved directory if no CLI argument
     if source_dir is None:
-        saved = settings.value("last_dbf_directory", "")
+        saved = settings.last_dbf_directory
         if saved:
             candidate = Path(saved)
             if (candidate / "MASTER.DBF").exists():
                 source_dir = candidate
 
     if source_dir is None:
-        # Ask user to select directory
         dir_path = QFileDialog.getExistingDirectory(
             None, "Select directory containing MASTER.DBF"
         )
@@ -58,13 +56,11 @@ def main() -> None:
         else:
             sys.exit(0)
 
-    # Save the directory for next launch
-    settings.setValue("last_dbf_directory", str(source_dir))
+    settings.last_dbf_directory = str(source_dir)
 
     # Resolve database path
-    saved_db = settings.value("db_path", "")
     db_path = None
-
+    saved_db = settings.db_path
     if saved_db:
         candidate = Path(saved_db)
         if candidate.exists():
@@ -90,10 +86,9 @@ def main() -> None:
         db_path = Path(path)
         if db_path.suffix.lower() != ".db":
             db_path = db_path.with_suffix(".db")
-        settings.setValue("db_path", str(db_path))
+        settings.db_path = str(db_path)
 
-    # Resolve username: use saved name if set, else OS login
-    user_name = settings.value("user_name", "") or getpass.getuser()
+    user_name = settings.user_name or getpass.getuser()
 
     db = Database(db_path)
     db.connect()

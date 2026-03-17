@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from PyQt5.QtCore import QSettings
 from PyQt5.QtGui import QColor, QPalette
 from PyQt5.QtWidgets import (
     QApplication,
@@ -14,6 +13,8 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QVBoxLayout,
 )
+
+from .app_settings import settings
 
 
 def apply_theme(theme: str) -> None:
@@ -52,7 +53,6 @@ class OptionsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Options")
         self.setMinimumWidth(380)
-        self._settings = QSettings()
         self._setup_ui()
         self._load()
 
@@ -63,10 +63,15 @@ class OptionsDialog(QDialog):
         general_group = QGroupBox("General")
         general_layout = QFormLayout(general_group)
 
-        self._auto_snapshot_cb = QCheckBox(
+        self._auto_backup_cb = QCheckBox(
             "Take snapshot automatically on ctback32 backup"
         )
-        general_layout.addRow(self._auto_snapshot_cb)
+        general_layout.addRow(self._auto_backup_cb)
+
+        self._auto_restore_cb = QCheckBox(
+            "Take snapshot automatically after ctback32 restore"
+        )
+        general_layout.addRow(self._auto_restore_cb)
 
         self._auto_compare_cb = QCheckBox(
             "Auto-compare two most recent snapshots on startup"
@@ -94,24 +99,17 @@ class OptionsDialog(QDialog):
         layout.addWidget(buttons)
 
     def _load(self) -> None:
-        self._auto_snapshot_cb.setChecked(
-            self._settings.value("options/auto_snapshot", False, type=bool)
-        )
-        self._auto_compare_cb.setChecked(
-            self._settings.value("options/auto_compare", True, type=bool)
-        )
-        theme = self._settings.value("options/theme", "System")
-        idx = self._theme_combo.findText(str(theme))
+        self._auto_backup_cb.setChecked(settings.auto_backup)
+        self._auto_restore_cb.setChecked(settings.auto_restore)
+        self._auto_compare_cb.setChecked(settings.auto_compare)
+        idx = self._theme_combo.findText(settings.theme)
         self._theme_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
     def _save_and_accept(self) -> None:
-        self._settings.setValue(
-            "options/auto_snapshot", self._auto_snapshot_cb.isChecked()
-        )
-        self._settings.setValue(
-            "options/auto_compare", self._auto_compare_cb.isChecked()
-        )
+        settings.auto_backup = self._auto_backup_cb.isChecked()
+        settings.auto_restore = self._auto_restore_cb.isChecked()
+        settings.auto_compare = self._auto_compare_cb.isChecked()
         theme = self._theme_combo.currentText()
-        self._settings.setValue("options/theme", theme)
+        settings.theme = theme
         apply_theme(theme.lower())
         self.accept()
