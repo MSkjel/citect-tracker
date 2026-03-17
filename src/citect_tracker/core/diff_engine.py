@@ -118,6 +118,13 @@ class DiffEngine:
 
             changes_by_project[project][table].append(diff)
 
+        # Rename detection: match Deleted+Added pairs with identical non-key fields.
+        # Each matched pair becomes a single Modified diff (key field changed).
+        renames = _detect_renames(changes_by_project)
+        added -= renames
+        deleted -= renames
+        modified += renames
+
         # Tag each diff with the snapshot where that change last appeared.
         # If intermediate snapshots are provided, do sequential pairwise find_changes
         # (hash-only, no field fetches) to build a key→label map.
@@ -160,6 +167,57 @@ class DiffEngine:
             deleted_count=deleted,
             changes_by_project=changes_by_project,
         )
+
+
+def _detect_renames(
+    changes_by_project: dict[str, dict[str, list[RecordDiff]]],
+) -> int:
+    """Match Deleted+Added pairs with identical non-key fields within each project/table.
+
+    Converts matched pairs into a single Renamed diff with ``renamed_from`` set
+    to the old key. Returns the number of renames detected.
+    """
+    renames = 0
+    for tables in changes_by_project.values():
+        for diffs in tables.values():
+            if not diffs:
+                continue
+            key_field = diffs[0].table_type.key_field
+            ignore = {key_field}
+
+            deleted = [d for d in diffs if d.change_type == ChangeType.DELETED and d.old_fields]
+            added = [d for d in diffs if d.change_type == ChangeType.ADDED and d.new_fields]
+            if not deleted or not added:
+                continue
+
+            def _content(fields: dict[str, str]) -> tuple[tuple[str, str], ...]:
+                return tuple(sorted((k, v) for k, v in fields.items() if k not in ignore))
+
+            # Index deleted records by their non-key content (first match wins)
+            deleted_by_content: dict[tuple[tuple[str, str], ...], RecordDiff] = {}
+            for d in deleted:
+                assert d.old_fields is not None
+                key = _content(d.old_fields)
+                if key not in deleted_by_content:
+                    deleted_by_content[key] = d
+
+            to_remove: list[RecordDiff] = []
+            for a in added:
+                assert a.new_fields is not None
+                key = _content(a.new_fields)
+                if key in deleted_by_content:
+                    d = deleted_by_content.pop(key)
+                    # Merge: convert the Added diff into a Modified diff (key field changed)
+                    a.change_type = ChangeType.MODIFIED
+                    a.old_fields = d.old_fields
+                    a.changed_fields = [key_field]
+                    to_remove.append(d)
+                    renames += 1
+
+            for d in to_remove:
+                diffs.remove(d)
+
+    return renames
 
 
 def _compute_changed_fields(

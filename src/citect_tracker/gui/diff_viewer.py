@@ -30,9 +30,9 @@ from .filter_bar import FilterBar
 
 # Colors that work on both light and dark backgrounds
 TYPE_COLORS = {
-    ChangeType.ADDED: QColor(80, 200, 80),      # Green
+    ChangeType.ADDED:    QColor(80, 200, 80),    # Green
     ChangeType.MODIFIED: QColor(220, 180, 50),   # Amber
-    ChangeType.DELETED: QColor(220, 80, 80),     # Red
+    ChangeType.DELETED:  QColor(220, 80, 80),    # Red
 }
 
 # Maps table column index → DiffFilterProxy field key (used by HighlightDelegate)
