@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Generator, Optional
+from typing import Collection, Generator, Optional
 
 import xxhash
 
@@ -89,6 +89,8 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA cache_size = -32000")
+        self._conn.execute("PRAGMA temp_store = MEMORY")
         self._conn.row_factory = sqlite3.Row
         self._init_schema()
 
@@ -446,6 +448,26 @@ class Database:
         if row is None:
             return {}
         return json.loads(row["fields_json"])
+
+    def get_record_fields_batch(
+        self, hashes: Collection[bytes]
+    ) -> dict[bytes, dict[str, str]]:
+        """Fetch fields for multiple hashes in one (or more) queries.
+
+        Chunks into groups of 900 to respect SQLite's 999-parameter limit.
+        """
+        unique = list(set(hashes))
+        result: dict[bytes, dict[str, str]] = {}
+        for i in range(0, len(unique), 900):
+            chunk = unique[i : i + 900]
+            placeholders = ", ".join("?" * len(chunk))
+            cur = self.conn.execute(
+                f"SELECT hash, fields_json FROM record_data WHERE hash IN ({placeholders})",
+                chunk,
+            )
+            for row in cur.fetchall():
+                result[bytes(row["hash"])] = json.loads(row["fields_json"])
+        return result
 
     # -- Diff queries --
 

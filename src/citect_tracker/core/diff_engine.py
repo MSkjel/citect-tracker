@@ -60,6 +60,11 @@ class DiffEngine:
                 c for c in raw_changes if c["project_name"] not in excluded_projects
             ]
 
+        # Batch-load all record fields upfront to avoid N+1 queries
+        old_hashes = {bytes(c["old_hash"]) for c in raw_changes if c["old_hash"] is not None}
+        new_hashes = {bytes(c["new_hash"]) for c in raw_changes if c["new_hash"] is not None}
+        fields_cache = self.db.get_record_fields_batch(old_hashes | new_hashes)
+
         changes_by_project: dict[str, dict[str, list[RecordDiff]]] = {}
         added = modified = deleted = 0
 
@@ -75,8 +80,8 @@ class DiffEngine:
             change_type_str = change["change_type"]
 
             if change_type_str == "modified":
-                old_fields = self.db.get_record_fields(change["old_hash"])
-                new_fields = self.db.get_record_fields(change["new_hash"])
+                old_fields = fields_cache.get(bytes(change["old_hash"]), {})
+                new_fields = fields_cache.get(bytes(change["new_hash"]), {})
                 changed = _compute_changed_fields(old_fields, new_fields)
 
                 diff = RecordDiff(
@@ -91,7 +96,7 @@ class DiffEngine:
                 modified += 1
 
             elif change_type_str == "added":
-                new_fields = self.db.get_record_fields(change["new_hash"])
+                new_fields = fields_cache.get(bytes(change["new_hash"]), {})
                 diff = RecordDiff(
                     change_type=ChangeType.ADDED,
                     project_name=project,
@@ -104,7 +109,7 @@ class DiffEngine:
                 added += 1
 
             else:  # deleted
-                old_fields = self.db.get_record_fields(change["old_hash"])
+                old_fields = fields_cache.get(bytes(change["old_hash"]), {})
                 diff = RecordDiff(
                     change_type=ChangeType.DELETED,
                     project_name=project,

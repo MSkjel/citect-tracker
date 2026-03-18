@@ -126,21 +126,35 @@ class DiffTableModel(QAbstractTableModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._diffs: list[RecordDiff] = []
+        self._filter_cache: list[tuple[str, str]] = []
 
     def set_diffs(self, diffs: list[RecordDiff]) -> None:
         self.beginResetModel()
         self._diffs = diffs
+        self._filter_cache = [
+            (
+                "\x00".join((d.old_fields or {}).values()),
+                "\x00".join((d.new_fields or {}).values()),
+            )
+            for d in diffs
+        ]
         self.endResetModel()
 
     def clear(self) -> None:
         self.beginResetModel()
         self._diffs = []
+        self._filter_cache = []
         self.endResetModel()
 
     def get_diff(self, row: int) -> Optional[RecordDiff]:
         if 0 <= row < len(self._diffs):
             return self._diffs[row]
         return None
+
+    def get_filter_strings(self, row: int) -> tuple[str, str]:
+        if 0 <= row < len(self._filter_cache):
+            return self._filter_cache[row]
+        return ("", "")
 
     def rowCount(self, parent=QModelIndex()) -> int:
         return len(self._diffs)
@@ -432,7 +446,8 @@ class DiffFilterProxy(QSortFilterProxyModel):
         if model is None:
             return True
 
-        diff = cast(DiffTableModel, model).get_diff(source_row)
+        source_model = cast(DiffTableModel, model)
+        diff = source_model.get_diff(source_row)
         if diff is None:
             return True
 
@@ -448,13 +463,14 @@ class DiffFilterProxy(QSortFilterProxyModel):
         if not any(self._field_patterns.values()):
             return True
 
+        old_str, new_str = source_model.get_filter_strings(source_row)
         field_candidates: dict[str, list[str]] = {
             "key":       [diff.record_key],
             "project":   [diff.project_name],
             "table":     [diff.table_type.value],
             "field":     diff.changed_fields,
-            "old_value": list((diff.old_fields or {}).values()),
-            "new_value": list((diff.new_fields or {}).values()),
+            "old_value": [old_str],
+            "new_value": [new_str],
             "snapshot":  [diff.snapshot_label],
         }
 

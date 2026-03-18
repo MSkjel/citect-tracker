@@ -84,19 +84,13 @@ def recover_record(
 
     key_offset, key_len = field_offsets[key_field]
 
-    # Find the record by key
-    target_row = _find_record(
-        file_data, nrecs, hlen, rlen, key_offset, key_len, diff.record_key
-    )
-
-    if target_row is None:
-        raise RecoverError(
-            f"Record '{diff.record_key}' not found in {dbf_path.name}"
-        )
-
-    record_start = hlen + target_row * rlen
-
     if diff.change_type == ChangeType.ADDED:
+        target_row = _find_record(
+            file_data, nrecs, hlen, rlen, key_offset, key_len, diff.record_key
+        )
+        if target_row is None:
+            raise RecoverError(f"Record '{diff.record_key}' not found in {dbf_path.name}")
+        record_start = hlen + target_row * rlen
         # Soft-delete: set deletion flag to 0x2A ('*')
         file_data[record_start] = 0x2A
         _write_file(dbf_path, file_data)
@@ -107,6 +101,12 @@ def recover_record(
             raise RecoverError(
                 f"No old field data available for '{diff.record_key}'"
             )
+        target_row = _find_record(
+            file_data, nrecs, hlen, rlen, key_offset, key_len, diff.record_key
+        )
+        if target_row is None:
+            raise RecoverError(f"Record '{diff.record_key}' not found in {dbf_path.name}")
+        record_start = hlen + target_row * rlen
 
         # Overwrite changed fields with old values
         changed_count = 0
