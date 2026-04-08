@@ -91,7 +91,11 @@ def main() -> None:
     user_name = settings.user_name or getpass.getuser()
 
     db = Database(db_path)
-    db.connect()
+    try:
+        db.connect()
+    except RuntimeError as e:
+        QMessageBox.critical(None, "Database Error", str(e))
+        sys.exit(1)
 
     try:
         window = MainWindow(db, source_dir, user_name=user_name)

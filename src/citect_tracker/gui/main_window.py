@@ -269,9 +269,15 @@ class MainWindow(QMainWindow):
         db_path = Path(path)
         if db_path.suffix.lower() != ".db":
             db_path = db_path.with_suffix(".db")
-        self.db.close()
-        self.db = Database(db_path)
-        self.db.connect()
+        old_db = self.db
+        new_db = Database(db_path)
+        try:
+            new_db.connect()
+        except RuntimeError as e:
+            QMessageBox.critical(self, "Database Error", str(e))
+            return
+        old_db.close()
+        self.db = new_db
         self.snapshot_engine = SnapshotEngine(self.db)
         self.diff_engine = DiffEngine(self.db)
         settings.db_path = str(db_path)

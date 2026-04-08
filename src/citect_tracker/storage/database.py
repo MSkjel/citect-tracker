@@ -116,20 +116,30 @@ class Database:
             raise
 
     def _init_schema(self) -> None:
+        # Check for incompatible existing schema before running SCHEMA_SQL,
+        # which would fail on old tables with different columns.
+        existing = self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'"
+        ).fetchone()
+        if existing:
+            row = self.conn.execute(
+                "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
+            ).fetchone()
+            if row is not None and row["version"] != SCHEMA_VERSION:
+                raise RuntimeError(
+                    f"Database schema version {row['version']} is incompatible with "
+                    f"the required version {SCHEMA_VERSION}. "
+                    "Please create a new database."
+                )
+
         self.conn.executescript(SCHEMA_SQL)
-        cur = self.conn.execute(
+        # Set version for fresh databases
+        row = self.conn.execute(
             "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
-        )
-        row = cur.fetchone()
+        ).fetchone()
         if row is None:
             self.conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,)
-            )
-        elif row["version"] != SCHEMA_VERSION:
-            raise RuntimeError(
-                f"Database schema version {row['version']} is incompatible with "
-                f"the required version {SCHEMA_VERSION}. "
-                "Please create a new database."
             )
         self.conn.commit()
 
@@ -300,27 +310,21 @@ class Database:
             f"{project.title}\x00{includes_json}".encode()
         )
 
-        # Find previous snapshot
-        prev_row = self.conn.execute(
-            "SELECT id FROM snapshots WHERE id < ? ORDER BY id DESC LIMIT 1",
-            (snapshot_id,),
+        # Find the latest version for this project (handles partial snapshot gaps)
+        prev_ver = self.conn.execute(
+            "SELECT data_hash, first_snapshot_id FROM snapshot_projects "
+            "WHERE project_name = ? ORDER BY last_snapshot_id DESC LIMIT 1",
+            (project.name,),
         ).fetchone()
-        prev_snapshot_id = prev_row["id"] if prev_row else None
 
-        if prev_snapshot_id is not None:
-            prev_ver = self.conn.execute(
-                "SELECT data_hash, first_snapshot_id FROM snapshot_projects "
-                "WHERE project_name = ? AND last_snapshot_id = ?",
-                (project.name, prev_snapshot_id),
-            ).fetchone()
-            if prev_ver is not None and bytes(prev_ver["data_hash"]) == h:
-                # Same data — extend range
-                self.conn.execute(
-                    "UPDATE snapshot_projects SET last_snapshot_id = ? "
-                    "WHERE project_name = ? AND first_snapshot_id = ?",
-                    (snapshot_id, project.name, prev_ver["first_snapshot_id"]),
-                )
-                return
+        if prev_ver is not None and bytes(prev_ver["data_hash"]) == h:
+            # Same data - extend range
+            self.conn.execute(
+                "UPDATE snapshot_projects SET last_snapshot_id = ? "
+                "WHERE project_name = ? AND first_snapshot_id = ?",
+                (snapshot_id, project.name, prev_ver["first_snapshot_id"]),
+            )
+            return
 
         # New or changed — insert data + new version row
         self.conn.execute(
@@ -365,29 +369,27 @@ class Database:
         if not records:
             return
 
-        # Find the previous snapshot ID
-        prev_row = self.conn.execute(
-            "SELECT id FROM snapshots WHERE id < ? ORDER BY id DESC LIMIT 1",
-            (snapshot_id,),
-        ).fetchone()
-        prev_snapshot_id = prev_row["id"] if prev_row else None
-
         records_by_key = {r.key: r for r in records}
 
-        if prev_snapshot_id is not None:
-            # Fetch versions active at the previous snapshot for this project/table
-            cur = self.conn.execute(
-                "SELECT record_key, record_hash, first_snapshot_id "
-                "FROM record_versions "
-                "WHERE project_name = ? AND table_type = ? "
-                "AND last_snapshot_id = ?",
-                (project_name, table_type.value, prev_snapshot_id),
-            )
-            prev_versions = {
-                row["record_key"]: (bytes(row["record_hash"]), row["first_snapshot_id"])
-                for row in cur.fetchall()
-            }
+        # Fetch the latest version of each record for this project/table.
+        # Uses idx_rv_active (project_name, table_type, record_key, last_snapshot_id)
+        # to return rows ordered by key then last_snapshot_id DESC, so the first
+        # row per key is the most recent. Correctly handles partial snapshots
+        # that skip this project.
+        cur = self.conn.execute(
+            "SELECT record_key, record_hash, first_snapshot_id "
+            "FROM record_versions "
+            "WHERE project_name = ? AND table_type = ? "
+            "ORDER BY record_key, last_snapshot_id DESC",
+            (project_name, table_type.value),
+        )
+        prev_versions: dict[str, tuple[bytes, int]] = {}
+        for row in cur.fetchall():
+            key = row["record_key"]
+            if key not in prev_versions:
+                prev_versions[key] = (bytes(row["record_hash"]), row["first_snapshot_id"])
 
+        if prev_versions:
             extend_rows = []
             new_records: list[TableRecord] = []
 
@@ -478,7 +480,10 @@ class Database:
         project_filter: Optional[set[str]] = None,
         table_filter: Optional[TableType] = None,
     ) -> list[dict]:
-        """Find all record changes between two snapshots using SQL JOINs.
+        """Find all record changes between two snapshots.
+
+        Materializes each snapshot's state into temp tables, then joins them.
+        This avoids repeated full-table scans on record_versions.
 
         Args:
             project_filter: Set of project names to include (None = all projects).
@@ -486,84 +491,83 @@ class Database:
         Returns list of dicts with keys:
             change_type, project_name, table_type, record_key, old_hash, new_hash
         """
-        conditions = []
-        params: dict = {"old_id": old_id, "new_id": new_id}
-
+        # Build optional WHERE clauses for project/table filtering
+        extra_where = ""
+        filter_params: list = []
         if project_filter:
-            placeholders = ", ".join(f":p{i}" for i in range(len(project_filter)))
-            conditions.append(f"AND project_name IN ({placeholders})")
-            for i, name in enumerate(project_filter):
-                params[f"p{i}"] = name
+            placeholders = ", ".join("?" * len(project_filter))
+            extra_where += f" AND project_name IN ({placeholders})"
+            filter_params.extend(project_filter)
         if table_filter:
-            conditions.append("AND table_type = :table_filter")
-            params["table_filter"] = table_filter.value
+            extra_where += " AND table_type = ?"
+            filter_params.append(table_filter.value)
 
-        extra = " ".join(conditions)
+        # Materialize old and new snapshot states into temp tables
+        self.conn.execute("DROP TABLE IF EXISTS _diff_old")
+        self.conn.execute("DROP TABLE IF EXISTS _diff_new")
 
-        query = f"""
-        -- DELETED: in old but not in new
+        self.conn.execute(
+            "CREATE TEMP TABLE _diff_old AS "
+            "SELECT project_name, table_type, record_key, record_hash "
+            "FROM record_versions "
+            f"WHERE first_snapshot_id <= ? AND last_snapshot_id >= ?{extra_where}",
+            [old_id, old_id] + filter_params,
+        )
+        self.conn.execute(
+            "CREATE TEMP TABLE _diff_new AS "
+            "SELECT project_name, table_type, record_key, record_hash "
+            "FROM record_versions "
+            f"WHERE first_snapshot_id <= ? AND last_snapshot_id >= ?{extra_where}",
+            [new_id, new_id] + filter_params,
+        )
+
+        self.conn.execute(
+            "CREATE INDEX _idx_diff_old ON _diff_old(project_name, table_type, record_key)"
+        )
+        self.conn.execute(
+            "CREATE INDEX _idx_diff_new ON _diff_new(project_name, table_type, record_key)"
+        )
+
+        query = """
         SELECT 'deleted' as change_type,
-               old_r.project_name as project_name,
-               old_r.table_type as table_type,
-               old_r.record_key as record_key,
-               old_r.record_hash as old_hash, NULL as new_hash
-        FROM record_versions old_r
-        LEFT JOIN record_versions new_r
-            ON old_r.project_name = new_r.project_name
-            AND old_r.table_type = new_r.table_type
-            AND old_r.record_key = new_r.record_key
-            AND new_r.first_snapshot_id <= :new_id
-            AND new_r.last_snapshot_id >= :new_id
-        WHERE old_r.first_snapshot_id <= :old_id
-            AND old_r.last_snapshot_id >= :old_id
-            AND new_r.record_key IS NULL
-            {extra.replace('project_name', 'old_r.project_name').replace('table_type', 'old_r.table_type') if extra else ''}
+               o.project_name, o.table_type, o.record_key,
+               o.record_hash as old_hash, NULL as new_hash
+        FROM _diff_old o
+        LEFT JOIN _diff_new n
+            ON o.project_name = n.project_name
+            AND o.table_type = n.table_type
+            AND o.record_key = n.record_key
+        WHERE n.record_key IS NULL
 
         UNION ALL
 
-        -- ADDED: in new but not in old
-        SELECT 'added' as change_type,
-               new_r.project_name as project_name,
-               new_r.table_type as table_type,
-               new_r.record_key as record_key,
-               NULL as old_hash, new_r.record_hash as new_hash
-        FROM record_versions new_r
-        LEFT JOIN record_versions old_r
-            ON new_r.project_name = old_r.project_name
-            AND new_r.table_type = old_r.table_type
-            AND new_r.record_key = old_r.record_key
-            AND old_r.first_snapshot_id <= :old_id
-            AND old_r.last_snapshot_id >= :old_id
-        WHERE new_r.first_snapshot_id <= :new_id
-            AND new_r.last_snapshot_id >= :new_id
-            AND old_r.record_key IS NULL
-            {extra.replace('project_name', 'new_r.project_name').replace('table_type', 'new_r.table_type') if extra else ''}
+        SELECT 'added',
+               n.project_name, n.table_type, n.record_key,
+               NULL, n.record_hash
+        FROM _diff_new n
+        LEFT JOIN _diff_old o
+            ON n.project_name = o.project_name
+            AND n.table_type = o.table_type
+            AND n.record_key = o.record_key
+        WHERE o.record_key IS NULL
 
         UNION ALL
 
-        -- MODIFIED: in both but different hash
-        SELECT 'modified' as change_type,
-               old_r.project_name as project_name,
-               old_r.table_type as table_type,
-               old_r.record_key as record_key,
-               old_r.record_hash as old_hash, new_r.record_hash as new_hash
-        FROM record_versions old_r
-        INNER JOIN record_versions new_r
-            ON old_r.project_name = new_r.project_name
-            AND old_r.table_type = new_r.table_type
-            AND old_r.record_key = new_r.record_key
-            AND new_r.first_snapshot_id <= :new_id
-            AND new_r.last_snapshot_id >= :new_id
-        WHERE old_r.first_snapshot_id <= :old_id
-            AND old_r.last_snapshot_id >= :old_id
-            AND old_r.record_hash != new_r.record_hash
-            {extra.replace('project_name', 'old_r.project_name').replace('table_type', 'old_r.table_type') if extra else ''}
+        SELECT 'modified',
+               o.project_name, o.table_type, o.record_key,
+               o.record_hash, n.record_hash
+        FROM _diff_old o
+        INNER JOIN _diff_new n
+            ON o.project_name = n.project_name
+            AND o.table_type = n.table_type
+            AND o.record_key = n.record_key
+        WHERE o.record_hash != n.record_hash
 
         ORDER BY 2, 3, 4
         """
 
-        cur = self.conn.execute(query, params)
-        return [
+        cur = self.conn.execute(query)
+        results = [
             {
                 "change_type": row["change_type"],
                 "project_name": row["project_name"],
@@ -574,6 +578,11 @@ class Database:
             }
             for row in cur.fetchall()
         ]
+
+        self.conn.execute("DROP TABLE IF EXISTS _diff_old")
+        self.conn.execute("DROP TABLE IF EXISTS _diff_new")
+
+        return results
 
     def cleanup_orphaned_records(self) -> None:
         """Remove record_data and project_data entries not referenced by any version."""
