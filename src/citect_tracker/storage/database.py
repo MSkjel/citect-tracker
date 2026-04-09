@@ -423,10 +423,23 @@ class Database:
                 else:
                     new_records.append(rec)
 
+            # Detect keys that disappeared (deleted/renamed away from DBF)
+            disappeared = set(prev_versions) - set(records_by_key)
+
+            # Remove stale entries from record_latest
+            if disappeared:
+                for i in range(0, len(disappeared), 900):
+                    chunk = list(disappeared)[i : i + 900]
+                    placeholders = ",".join("?" * len(chunk))
+                    self.conn.execute(
+                        f"DELETE FROM record_latest "
+                        f"WHERE project_name = ? AND table_type = ? "
+                        f"AND record_key IN ({placeholders})",
+                        [project_name, table_type.value] + chunk,
+                    )
+
             # Bulk extend version ranges for unchanged records
             if extend_keys:
-                # Detect keys that disappeared (deleted/renamed away from DBF)
-                disappeared = set(prev_versions) - set(records_by_key)
                 if not new_records and not disappeared:
                     # Fast path: ALL records unchanged, nothing gone
                     self.conn.execute(
