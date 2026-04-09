@@ -15,9 +15,14 @@ _IGNORED_FIELDS = {"OID"}
 
 
 def _compute_hash(fields: dict[str, str]) -> bytes:
-    """Compute xxh3_128 hash of canonical JSON representation."""
-    canonical = json.dumps(fields, sort_keys=True, ensure_ascii=False)
-    return xxhash.xxh3_128_digest(canonical.encode("utf-8"))
+    """Compute xxh3_128 hash via streaming updates (no JSON serialization)."""
+    h = xxhash.xxh3_128()
+    for k in sorted(fields):
+        h.update(k.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(fields[k].encode("utf-8"))
+        h.update(b"\x01")
+    return h.digest()
 
 
 def read_table(file_path: Path, table_type: TableType) -> list[TableRecord]:
@@ -81,7 +86,8 @@ def read_table(file_path: Path, table_type: TableType) -> list[TableRecord]:
             continue
 
         record_hash = _compute_hash(rec_fields)
-        records.append(TableRecord(key=key, fields=rec_fields, record_hash=record_hash))
+        fields_json = json.dumps(rec_fields, sort_keys=True, ensure_ascii=False)
+        records.append(TableRecord(key=key, fields=rec_fields, record_hash=record_hash, fields_json=fields_json))
 
     return records
 

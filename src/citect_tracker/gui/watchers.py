@@ -86,8 +86,7 @@ class ProcessWatcher(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._known_pids: set[int] = set()
-        # pid -> {"source_dir": str, "before": dict, "cmdline_project": str}
-        self._restore_pids: dict[int, dict[str, object]] = {}
+        self._restore_pids: dict[int, tuple[str, dict[str, float], str]] = {}
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._poll)
         self.source_dir: str = ""
@@ -133,11 +132,7 @@ class ProcessWatcher(QObject):
                         before: dict[str, float] = (
                             _scan_dbf_mtimes(self.source_dir) if self.source_dir else {}
                         )
-                        self._restore_pids[pid] = {
-                            "source_dir": self.source_dir,
-                            "before": before,
-                            "cmdline_project": project,
-                        }
+                        self._restore_pids[pid] = (self.source_dir, before, project)
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     pass
 
@@ -145,14 +140,12 @@ class ProcessWatcher(QObject):
             for pid in list(self._restore_pids):
                 if pid in current:
                     continue  # still running
-                info = self._restore_pids.pop(pid)
-                src = str(info["source_dir"])
-                before_state = dict(info["before"])  # type: ignore[arg-type]
+                src, before_state, cmdline_project = self._restore_pids.pop(pid)
                 project = ""
                 if src and before_state:
                     project = _find_changed_project(src, before_state)
                 if not project:
-                    project = str(info["cmdline_project"])
+                    project = cmdline_project
                 self.restore_completed.emit(project)
 
         except Exception:

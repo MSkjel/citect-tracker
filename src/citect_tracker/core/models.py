@@ -65,6 +65,7 @@ class TableRecord:
     key: str
     fields: dict[str, str]
     record_hash: bytes
+    fields_json: str = ""
 
 
 @dataclass

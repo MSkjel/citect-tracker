@@ -18,7 +18,7 @@ from ..core.models import (
     TableType,
 )
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 SCHEMA_SQL = """\
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -74,6 +74,15 @@ CREATE INDEX IF NOT EXISTS idx_rv_hash
     ON record_versions(record_hash);
 CREATE INDEX IF NOT EXISTS idx_rv_active
     ON record_versions(project_name, table_type, record_key, last_snapshot_id);
+
+CREATE TABLE IF NOT EXISTS record_latest (
+    project_name      TEXT NOT NULL,
+    table_type        TEXT NOT NULL,
+    record_key        TEXT NOT NULL,
+    record_hash       BLOB NOT NULL,
+    first_snapshot_id INTEGER NOT NULL,
+    PRIMARY KEY (project_name, table_type, record_key)
+);
 """
 
 
@@ -295,6 +304,26 @@ class Database:
 
         # Delete snapshot row
         self.conn.execute("DELETE FROM snapshots WHERE id = ?", (snapshot_id,))
+
+        # Rebuild record_latest from record_versions
+        self.conn.execute("DELETE FROM record_latest")
+        self.conn.execute(
+            "INSERT INTO record_latest "
+            "(project_name, table_type, record_key, record_hash, first_snapshot_id) "
+            "SELECT rv.project_name, rv.table_type, rv.record_key, "
+            "rv.record_hash, rv.first_snapshot_id "
+            "FROM record_versions rv "
+            "INNER JOIN ("
+            "  SELECT project_name, table_type, record_key, "
+            "  MAX(last_snapshot_id) AS max_last "
+            "  FROM record_versions "
+            "  GROUP BY project_name, table_type, record_key"
+            ") latest ON rv.project_name = latest.project_name "
+            "  AND rv.table_type = latest.table_type "
+            "  AND rv.record_key = latest.record_key "
+            "  AND rv.last_snapshot_id = latest.max_last"
+        )
+
         self.conn.commit()
 
         self.cleanup_orphaned_records()
@@ -371,22 +400,12 @@ class Database:
 
         records_by_key = {r.key: r for r in records}
 
-        # Fetch the latest version of each record for this project/table.
-        # The subquery finds MAX(last_snapshot_id) per key, then we join back
-        # to get the hash and first_snapshot_id. Correctly handles partial
-        # snapshots that skip this project without fetching all version rows.
+        # Fetch the latest version of each record from record_latest (no GROUP BY).
         cur = self.conn.execute(
-            "SELECT rv.record_key, rv.record_hash, rv.first_snapshot_id "
-            "FROM record_versions rv "
-            "INNER JOIN ("
-            "  SELECT record_key, MAX(last_snapshot_id) AS max_last "
-            "  FROM record_versions "
-            "  WHERE project_name = ? AND table_type = ? "
-            "  GROUP BY record_key"
-            ") latest ON rv.record_key = latest.record_key "
-            "  AND rv.last_snapshot_id = latest.max_last "
-            "WHERE rv.project_name = ? AND rv.table_type = ?",
-            (project_name, table_type.value, project_name, table_type.value),
+            "SELECT record_key, record_hash, first_snapshot_id "
+            "FROM record_latest "
+            "WHERE project_name = ? AND table_type = ?",
+            (project_name, table_type.value),
         )
         prev_versions: dict[str, tuple[bytes, int]] = {
             row["record_key"]: (bytes(row["record_hash"]), row["first_snapshot_id"])
@@ -394,32 +413,66 @@ class Database:
         }
 
         if prev_versions:
-            extend_rows = []
             new_records: list[TableRecord] = []
+            extend_keys: list[str] = []
 
             for key, rec in records_by_key.items():
                 prev = prev_versions.get(key)
                 if prev is not None and prev[0] == rec.record_hash:
-                    # Same hash — extend the existing range
-                    extend_rows.append(
-                        (snapshot_id, project_name, table_type.value, key, prev[1])
-                    )
+                    extend_keys.append(key)
                 else:
-                    # New record or changed hash — needs record_data + new version
                     new_records.append(rec)
 
-            if extend_rows:
-                self.conn.executemany(
-                    "UPDATE record_versions SET last_snapshot_id = ? "
-                    "WHERE project_name = ? AND table_type = ? "
-                    "AND record_key = ? AND first_snapshot_id = ?",
-                    extend_rows,
-                )
+            # Bulk extend version ranges for unchanged records
+            if extend_keys:
+                # Detect keys that disappeared (deleted/renamed away from DBF)
+                disappeared = set(prev_versions) - set(records_by_key)
+                if not new_records and not disappeared:
+                    # Fast path: ALL records unchanged, nothing gone
+                    self.conn.execute(
+                        "UPDATE record_versions SET last_snapshot_id = ? "
+                        "WHERE project_name = ? AND table_type = ? "
+                        "AND (record_key, first_snapshot_id) IN ("
+                        "  SELECT record_key, first_snapshot_id FROM record_latest "
+                        "  WHERE project_name = ? AND table_type = ?"
+                        ")",
+                        (snapshot_id, project_name, table_type.value,
+                         project_name, table_type.value),
+                    )
+                else:
+                    # Exclude changed/new keys AND disappeared keys from bulk update
+                    exclude_keys = [r.key for r in new_records] + list(disappeared)
+                    if len(exclude_keys) < 900:
+                        placeholders = ",".join("?" * len(exclude_keys))
+                        self.conn.execute(
+                            f"UPDATE record_versions SET last_snapshot_id = ? "
+                            f"WHERE project_name = ? AND table_type = ? "
+                            f"AND (record_key, first_snapshot_id) IN ("
+                            f"  SELECT record_key, first_snapshot_id FROM record_latest "
+                            f"  WHERE project_name = ? AND table_type = ?"
+                            f"  AND record_key NOT IN ({placeholders})"
+                            f")",
+                            [snapshot_id, project_name, table_type.value,
+                             project_name, table_type.value] + exclude_keys,
+                        )
+                    else:
+                        # Too many excluded keys, fall back to executemany
+                        extend_set = set(extend_keys)
+                        extend_rows = [
+                            (snapshot_id, project_name, table_type.value, key, prev_versions[key][1])
+                            for key in extend_set
+                        ]
+                        self.conn.executemany(
+                            "UPDATE record_versions SET last_snapshot_id = ? "
+                            "WHERE project_name = ? AND table_type = ? "
+                            "AND record_key = ? AND first_snapshot_id = ?",
+                            extend_rows,
+                        )
 
             if new_records:
                 self.conn.executemany(
                     "INSERT OR IGNORE INTO record_data (hash, fields_json) VALUES (?, ?)",
-                    [(r.record_hash, json.dumps(r.fields, ensure_ascii=False)) for r in new_records],
+                    [(r.record_hash, r.fields_json) for r in new_records],
                 )
                 self.conn.executemany(
                     "INSERT INTO record_versions "
@@ -429,12 +482,20 @@ class Database:
                     [(project_name, table_type.value, r.key, r.record_hash, snapshot_id, snapshot_id)
                      for r in new_records],
                 )
+                # Update record_latest for changed/new records
+                self.conn.executemany(
+                    "INSERT OR REPLACE INTO record_latest "
+                    "(project_name, table_type, record_key, record_hash, first_snapshot_id) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(project_name, table_type.value, r.key, r.record_hash, snapshot_id)
+                     for r in new_records],
+                )
         else:
-            # First snapshot — all records need record_data + new versions
+            # First snapshot — all records are new
             unique_records = list(records_by_key.values())
             self.conn.executemany(
                 "INSERT OR IGNORE INTO record_data (hash, fields_json) VALUES (?, ?)",
-                [(r.record_hash, json.dumps(r.fields, ensure_ascii=False)) for r in unique_records],
+                [(r.record_hash, r.fields_json) for r in unique_records],
             )
             self.conn.executemany(
                 "INSERT INTO record_versions "
@@ -442,6 +503,13 @@ class Database:
                 "first_snapshot_id, last_snapshot_id) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 [(project_name, table_type.value, r.key, r.record_hash, snapshot_id, snapshot_id)
+                 for r in unique_records],
+            )
+            self.conn.executemany(
+                "INSERT INTO record_latest "
+                "(project_name, table_type, record_key, record_hash, first_snapshot_id) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [(project_name, table_type.value, r.key, r.record_hash, snapshot_id)
                  for r in unique_records],
             )
 
