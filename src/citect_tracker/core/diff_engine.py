@@ -130,9 +130,10 @@ class DiffEngine:
         deleted -= renames
         modified += renames
 
-        # Tag each diff with the snapshot where that change last appeared.
-        # If intermediate snapshots are provided, do sequential pairwise find_changes
-        # (hash-only, no field fetches) to build a key→label map.
+        # Tag each diff with the snapshot where the change was introduced.
+        # find_changes() returns new_first_snap (first_snapshot_id of the new
+        # version), which tells us exactly when the current version appeared —
+        # no extra queries needed.
         all_diffs = [
             d
             for tables in changes_by_project.values()
@@ -143,26 +144,30 @@ class DiffEngine:
             return f"{snap.timestamp.strftime('%Y-%m-%d %H:%M')} | {snap.label}"
 
         if intermediate_snapshots and len(intermediate_snapshots) >= 2:
-            key_to_label: dict[tuple[str, str, str], str] = {}
-            for i in range(len(intermediate_snapshots) - 1):
-                pair_old_id = intermediate_snapshots[i].snapshot_id
-                pair_new_id = intermediate_snapshots[i + 1].snapshot_id
-                pair_label = _fmt(intermediate_snapshots[i + 1])
-                pair_changes = self.db.find_changes(
-                    pair_old_id, pair_new_id, effective_filter, table_filter
-                )
-                for c in pair_changes:
-                    if excluded_projects and c["project_name"] in excluded_projects:
-                        continue
-                    key_to_label[(c["project_name"], c["table_type"], c["record_key"])] = pair_label
+            # Build snapshot_id → label map from intermediate snapshots
+            snap_id_to_label = {
+                s.snapshot_id: _fmt(s) for s in intermediate_snapshots
+            }
+            # Map each change's new_first_snap to the snapshot label
+            change_first_snap: dict[tuple[str, str, str], int | None] = {}
+            for c in raw_changes:
+                change_first_snap[
+                    (c["project_name"], c["table_type"], c["record_key"])
+                ] = c.get("new_first_snap")
+
+            default_label = _fmt(new_meta)
             for diff in all_diffs:
-                diff.snapshot_label = key_to_label.get(
-                    (diff.project_name, diff.table_type.value, diff.record_key),
-                    _fmt(new_meta),
+                first_snap = change_first_snap.get(
+                    (diff.project_name, diff.table_type.value, diff.record_key)
                 )
+                if first_snap is not None and first_snap in snap_id_to_label:
+                    diff.snapshot_label = snap_id_to_label[first_snap]
+                else:
+                    diff.snapshot_label = default_label
         else:
+            label = _fmt(new_meta)
             for diff in all_diffs:
-                diff.snapshot_label = _fmt(new_meta)
+                diff.snapshot_label = label
 
         return DiffSummary(
             old_snapshot=old_meta,
@@ -219,8 +224,9 @@ def _detect_renames(
                     to_remove.append(d)
                     renames += 1
 
-            for d in to_remove:
-                diffs.remove(d)
+            if to_remove:
+                to_remove_ids = {id(d) for d in to_remove}
+                diffs[:] = [d for d in diffs if id(d) not in to_remove_ids]
 
     return renames
 

@@ -58,7 +58,8 @@ def main() -> None:
 
     settings.last_dbf_directory = str(source_dir)
 
-    # Resolve database path
+    # Resolve database path, loop so schema errors can retry with a new DB
+    db = None
     db_path = None
     saved_db = settings.db_path
     if saved_db:
@@ -73,29 +74,35 @@ def main() -> None:
                 "Please select an existing database or create a new one.",
             )
 
-    if db_path is None:
-        path, _ = QFileDialog.getSaveFileName(
-            None,
-            "Open / Create Tracker Database",
-            str(source_dir) if source_dir else "",
-            "SQLite Database (*.db)",
-            options=QFileDialog.Option.DontConfirmOverwrite,
-        )
-        if not path:
-            sys.exit(0)
-        db_path = Path(path)
-        if db_path.suffix.lower() != ".db":
-            db_path = db_path.with_suffix(".db")
-        settings.db_path = str(db_path)
+    while db is None:
+        if db_path is None:
+            path, _ = QFileDialog.getSaveFileName(
+                None,
+                "Open / Create Tracker Database",
+                str(source_dir) if source_dir else "",
+                "SQLite Database (*.db)",
+                options=QFileDialog.Option.DontConfirmOverwrite,
+            )
+            if not path:
+                sys.exit(0)
+            db_path = Path(path)
+            if db_path.suffix.lower() != ".db":
+                db_path = db_path.with_suffix(".db")
+
+        try:
+            db = Database(db_path)
+            db.connect()
+            settings.db_path = str(db_path)
+        except RuntimeError as e:
+            QMessageBox.critical(
+                None,
+                "Database Error",
+                f"{e}\n\nPlease select or create a different database.",
+            )
+            db = None
+            db_path = None
 
     user_name = settings.user_name or getpass.getuser()
-
-    db = Database(db_path)
-    try:
-        db.connect()
-    except RuntimeError as e:
-        QMessageBox.critical(None, "Database Error", str(e))
-        sys.exit(1)
 
     try:
         window = MainWindow(db, source_dir, user_name=user_name)

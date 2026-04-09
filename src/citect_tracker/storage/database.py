@@ -372,22 +372,26 @@ class Database:
         records_by_key = {r.key: r for r in records}
 
         # Fetch the latest version of each record for this project/table.
-        # Uses idx_rv_active (project_name, table_type, record_key, last_snapshot_id)
-        # to return rows ordered by key then last_snapshot_id DESC, so the first
-        # row per key is the most recent. Correctly handles partial snapshots
-        # that skip this project.
+        # The subquery finds MAX(last_snapshot_id) per key, then we join back
+        # to get the hash and first_snapshot_id. Correctly handles partial
+        # snapshots that skip this project without fetching all version rows.
         cur = self.conn.execute(
-            "SELECT record_key, record_hash, first_snapshot_id "
-            "FROM record_versions "
-            "WHERE project_name = ? AND table_type = ? "
-            "ORDER BY record_key, last_snapshot_id DESC",
-            (project_name, table_type.value),
+            "SELECT rv.record_key, rv.record_hash, rv.first_snapshot_id "
+            "FROM record_versions rv "
+            "INNER JOIN ("
+            "  SELECT record_key, MAX(last_snapshot_id) AS max_last "
+            "  FROM record_versions "
+            "  WHERE project_name = ? AND table_type = ? "
+            "  GROUP BY record_key"
+            ") latest ON rv.record_key = latest.record_key "
+            "  AND rv.last_snapshot_id = latest.max_last "
+            "WHERE rv.project_name = ? AND rv.table_type = ?",
+            (project_name, table_type.value, project_name, table_type.value),
         )
-        prev_versions: dict[str, tuple[bytes, int]] = {}
-        for row in cur.fetchall():
-            key = row["record_key"]
-            if key not in prev_versions:
-                prev_versions[key] = (bytes(row["record_hash"]), row["first_snapshot_id"])
+        prev_versions: dict[str, tuple[bytes, int]] = {
+            row["record_key"]: (bytes(row["record_hash"]), row["first_snapshot_id"])
+            for row in cur.fetchall()
+        }
 
         if prev_versions:
             extend_rows = []
@@ -515,7 +519,7 @@ class Database:
         )
         self.conn.execute(
             "CREATE TEMP TABLE _diff_new AS "
-            "SELECT project_name, table_type, record_key, record_hash "
+            "SELECT project_name, table_type, record_key, record_hash, first_snapshot_id "
             "FROM record_versions "
             f"WHERE first_snapshot_id <= ? AND last_snapshot_id >= ?{extra_where}",
             [new_id, new_id] + filter_params,
@@ -531,7 +535,8 @@ class Database:
         query = """
         SELECT 'deleted' as change_type,
                o.project_name, o.table_type, o.record_key,
-               o.record_hash as old_hash, NULL as new_hash
+               o.record_hash as old_hash, NULL as new_hash,
+               NULL as new_first_snap
         FROM _diff_old o
         LEFT JOIN _diff_new n
             ON o.project_name = n.project_name
@@ -543,7 +548,8 @@ class Database:
 
         SELECT 'added',
                n.project_name, n.table_type, n.record_key,
-               NULL, n.record_hash
+               NULL, n.record_hash,
+               n.first_snapshot_id
         FROM _diff_new n
         LEFT JOIN _diff_old o
             ON n.project_name = o.project_name
@@ -555,7 +561,8 @@ class Database:
 
         SELECT 'modified',
                o.project_name, o.table_type, o.record_key,
-               o.record_hash, n.record_hash
+               o.record_hash, n.record_hash,
+               n.first_snapshot_id
         FROM _diff_old o
         INNER JOIN _diff_new n
             ON o.project_name = n.project_name
@@ -575,6 +582,7 @@ class Database:
                 "record_key": row["record_key"],
                 "old_hash": row["old_hash"],
                 "new_hash": row["new_hash"],
+                "new_first_snap": row["new_first_snap"],
             }
             for row in cur.fetchall()
         ]
@@ -587,11 +595,11 @@ class Database:
     def cleanup_orphaned_records(self) -> None:
         """Remove record_data and project_data entries not referenced by any version."""
         self.conn.execute(
-            "DELETE FROM record_data WHERE hash NOT IN "
-            "(SELECT DISTINCT record_hash FROM record_versions)"
+            "DELETE FROM record_data WHERE NOT EXISTS "
+            "(SELECT 1 FROM record_versions WHERE record_versions.record_hash = record_data.hash)"
         )
         self.conn.execute(
-            "DELETE FROM project_data WHERE hash NOT IN "
-            "(SELECT DISTINCT data_hash FROM snapshot_projects)"
+            "DELETE FROM project_data WHERE NOT EXISTS "
+            "(SELECT 1 FROM snapshot_projects WHERE snapshot_projects.data_hash = project_data.hash)"
         )
         self.conn.commit()
